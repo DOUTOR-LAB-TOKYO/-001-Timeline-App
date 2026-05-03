@@ -1,0 +1,996 @@
+import { useRef, useEffect, useState, useCallback } from 'react';
+import { useAppStore } from '../../store';
+import { interpolateValue } from '../../lib/interpolation';
+import { clamp } from '../../lib/utils';
+import { RULER_H, ROW_H } from '../../lib/constants';
+import type { Interpolation, Sequence, Keyframe } from '../../types';
+
+// ─── Constants ───────────────────────────────────────────────────────
+
+const KF_HALF = 5;
+const VALUE_PAD = 10;
+const SNAP_PX = 10;
+const BZ_R = 4;
+
+// ─── Coordinate helpers ──────────────────────────────────────────────
+
+function frameToX(frame: number, viewStart: number, zoom: number): number {
+  return (frame - viewStart) / zoom;
+}
+
+function xToFrame(x: number, viewStart: number, zoom: number): number {
+  return viewStart + x * zoom;
+}
+
+function valueToY(value: number, rowTop: number, seq: Sequence): number {
+  const range = seq.max - seq.min || 1;
+  const t = (value - seq.min) / range;
+  const usableH = ROW_H - 2 * VALUE_PAD;
+  return rowTop + ROW_H - VALUE_PAD - t * usableH;
+}
+
+function yToValue(y: number, rowTop: number, seq: Sequence): number {
+  const usableH = ROW_H - 2 * VALUE_PAD;
+  const t = (rowTop + ROW_H - VALUE_PAD - y) / usableH;
+  return clamp(seq.min + t * (seq.max - seq.min), seq.min, seq.max);
+}
+
+function getRowTop(seqIndex: number, vertScroll: number): number {
+  return RULER_H + seqIndex * ROW_H - vertScroll;
+}
+
+// ─── Bezier handle helpers ────────────────────────────────────────────
+
+interface BzHandlePos {
+  kx: number; ky: number; nkx: number; nky: number;
+  h1x: number; h1y: number; h2x: number; h2y: number;
+}
+
+function getBzHandles(
+  kf: Keyframe, nextKf: Keyframe,
+  rowTop: number, seq: Sequence,
+  vStart: number, z: number
+): BzHandlePos {
+  const kx = frameToX(kf.frame, vStart, z);
+  const ky = valueToY(kf.value, rowTop, seq);
+  const nkx = frameToX(nextKf.frame, vStart, z);
+  const nky = valueToY(nextKf.value, rowTop, seq);
+  const cp1x = kf.cp1x ?? 0.25;
+  const cp1y = kf.cp1y ?? 0.25;
+  const cp2x = kf.cp2x ?? 0.75;
+  const cp2y = kf.cp2y ?? 0.75;
+  return {
+    kx, ky, nkx, nky,
+    h1x: kx + cp1x * (nkx - kx),
+    h1y: ky + cp1y * (nky - ky),
+    h2x: kx + cp2x * (nkx - kx),
+    h2y: ky + cp2y * (nky - ky),
+  };
+}
+
+// ─── Snap helper ─────────────────────────────────────────────────────
+
+function getSnappedFrame(
+  rawFrame: number,
+  sequences: Sequence[],
+  zoom: number,
+  options: {
+    excludeSeqId?: string;       // skip ALL kfs in this sequence (prevents same-seq overwrite)
+    excludeFrames?: Set<number>; // skip these frames globally
+    gridSize?: number;           // also snap to multiples of this (0 = off)
+  } = {}
+): { frame: number; snapped: boolean } {
+  const threshold = SNAP_PX * zoom;
+  let best = rawFrame;
+  let bestDist = threshold;
+
+  // Snap to other keyframes
+  for (const seq of sequences) {
+    if (seq.id === options.excludeSeqId) continue;
+    for (const kf of seq.keyframes) {
+      if (options.excludeFrames?.has(kf.frame)) continue;
+      const dist = Math.abs(kf.frame - rawFrame);
+      if (dist < bestDist) { bestDist = dist; best = kf.frame; }
+    }
+  }
+
+  // Snap to frame grid
+  if (options.gridSize && options.gridSize > 0) {
+    const gridFrame = Math.round(rawFrame / options.gridSize) * options.gridSize;
+    const dist = Math.abs(gridFrame - rawFrame);
+    if (dist < bestDist) { bestDist = dist; best = gridFrame; }
+  }
+
+  return { frame: best, snapped: best !== rawFrame };
+}
+
+// ─── Ruler helpers ───────────────────────────────────────────────────
+
+function getRulerTick(zoom: number, fps: number): { major: number; minor: number } {
+  const minPxMajor = 55;
+  const candidates = [1, 2, 5, 10, 15, 30, fps, fps * 2, fps * 5, fps * 10, fps * 30, fps * 60];
+  const deduped = [...new Set(candidates)].sort((a, b) => a - b);
+  const major = deduped.find((c) => c / zoom >= minPxMajor) ?? deduped[deduped.length - 1];
+  const minor = Math.max(1, Math.round(major / 5));
+  return { major, minor };
+}
+
+function formatRulerLabel(frame: number, fps: number): string {
+  const totalSec = frame / fps;
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  if (m > 0) return `${m}:${String(Math.floor(s)).padStart(2, '0')}`;
+  return `${s.toFixed(s < 10 ? 2 : 1)}s`;
+}
+
+// ─── Hit tests ───────────────────────────────────────────────────────
+
+interface KfHit { seqId: string; seqIndex: number; frame: number; value: number; }
+
+function hitTestKeyframe(
+  x: number, y: number,
+  sequences: Sequence[],
+  viewStart: number, zoom: number, vertScroll: number
+): KfHit | null {
+  const hitR = KF_HALF + 6;
+  for (let i = 0; i < sequences.length; i++) {
+    const seq = sequences[i];
+    const rowTop = getRowTop(i, vertScroll);
+    for (const kf of seq.keyframes) {
+      const kx = frameToX(kf.frame, viewStart, zoom);
+      const ky = valueToY(kf.value, rowTop, seq);
+      if ((x - kx) ** 2 + (y - ky) ** 2 <= hitR ** 2) {
+        return { seqId: seq.id, seqIndex: i, frame: kf.frame, value: kf.value };
+      }
+    }
+  }
+  return null;
+}
+
+interface BzHit {
+  seqId: string; seqIndex: number;
+  frame: number; nextFrame: number;
+  handle: 'cp1' | 'cp2';
+}
+
+function hitTestBzHandle(
+  x: number, y: number,
+  sequences: Sequence[],
+  vStart: number, zoom: number, vertScroll: number,
+  selectedKeyframes: Map<string, Set<number>>
+): BzHit | null {
+  const hitR = BZ_R + 5;
+  for (let i = 0; i < sequences.length; i++) {
+    const seq = sequences[i];
+    const rowTop = getRowTop(i, vertScroll);
+    const sorted = [...seq.keyframes].sort((a, b) => a.frame - b.frame);
+    for (let j = 0; j < sorted.length - 1; j++) {
+      const kf = sorted[j];
+      if (kf.interpolation !== 'bezier') continue;
+      if (!(selectedKeyframes.get(seq.id)?.has(kf.frame) ?? false)) continue;
+      const nextKf = sorted[j + 1];
+      const { h1x, h1y, h2x, h2y } = getBzHandles(kf, nextKf, rowTop, seq, vStart, zoom);
+      if ((x - h1x) ** 2 + (y - h1y) ** 2 <= hitR ** 2) {
+        return { seqId: seq.id, seqIndex: i, frame: kf.frame, nextFrame: nextKf.frame, handle: 'cp1' };
+      }
+      if ((x - h2x) ** 2 + (y - h2y) ** 2 <= hitR ** 2) {
+        return { seqId: seq.id, seqIndex: i, frame: kf.frame, nextFrame: nextKf.frame, handle: 'cp2' };
+      }
+    }
+  }
+  return null;
+}
+
+// ─── Drag state ──────────────────────────────────────────────────────
+
+type DragType = 'idle' | 'seek' | 'kf' | 'pan' | 'marquee' | 'bz';
+
+interface MultiInitPos { seqId: string; frame: number; value: number; }
+
+interface DragState {
+  type: DragType;
+  startX: number; startY: number; startViewStart: number;
+  // kf drag
+  kfSeqId?: string; kfSeqIndex?: number; kfCurFrame?: number;
+  snapLocked?: number; snapTargetFrame?: number;
+  // multi-drag
+  kfMultiInitPositions?: MultiInitPos[];
+  kfAnchorInitFrame?: number;
+  kfPrevDelta?: number;
+  // bezier handle drag
+  bzSeqId?: string; bzFrame?: number; bzHandle?: 'cp1' | 'cp2'; bzNextFrame?: number;
+  // marquee
+  curX?: number; curY?: number;
+}
+
+// ─── Clipboard (module-level) ────────────────────────────────────────
+
+interface ClipEntry { seqId: string; relFrame: number; kf: Keyframe; }
+let kfClipboard: ClipEntry[] = [];
+
+// ─── Interp options ──────────────────────────────────────────────────
+
+const INTERP_OPTIONS: { value: Interpolation; label: string }[] = [
+  { value: 'step',   label: 'Step'   },
+  { value: 'linear', label: 'Linear' },
+  { value: 'smooth', label: 'Smooth' },
+  { value: 'bezier', label: 'Bezier' },
+];
+
+// ─── Component ───────────────────────────────────────────────────────
+
+export default function TimelineCanvas() {
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [size, setSize] = useState({ w: 0, h: 0 });
+  const [vertScroll, setVertScroll] = useState(0);
+  const [cursor, setCursor] = useState<string>('crosshair');
+  const [contextMenu, setContextMenu] = useState<{
+    x: number; y: number; seqId: string; frame: number; interp: Interpolation;
+  } | null>(null);
+
+  const project = useAppStore((s) => s.project);
+  const { sequences, fps, durationFrames } = project;
+  const currentFrame = useAppStore((s) => s.currentFrame);
+  const isPlaying = useAppStore((s) => s.isPlaying);
+  const viewStartFrame = useAppStore((s) => s.viewStartFrame);
+  const zoom = useAppStore((s) => s.zoom);
+  const selectedKeyframes = useAppStore((s) => s.selectedKeyframes);
+  const setCurrentFrame = useAppStore((s) => s.setCurrentFrame);
+  const setViewStartFrame = useAppStore((s) => s.setViewStartFrame);
+  const setZoom = useAppStore((s) => s.setZoom);
+  const setSelectedSequence = useAppStore((s) => s.setSelectedSequence);
+  const toggleKeyframeSelection = useAppStore((s) => s.toggleKeyframeSelection);
+  const setSelectedKeyframesBatch = useAppStore((s) => s.setSelectedKeyframesBatch);
+  const clearKeyframeSelection = useAppStore((s) => s.clearKeyframeSelection);
+  const addKeyframe = useAppStore((s) => s.addKeyframe);
+  const moveKeyframe = useAppStore((s) => s.moveKeyframe);
+  const moveKeyframesBatch = useAppStore((s) => s.moveKeyframesBatch);
+  const updateKeyframe = useAppStore((s) => s.updateKeyframe);
+  const snapGridSize = useAppStore((s) => s.snapGridSize);
+  const setSnapGridSize = useAppStore((s) => s.setSnapGridSize);
+
+  const drag = useRef<DragState>({ type: 'idle', startX: 0, startY: 0, startViewStart: 0 });
+
+  // ─── Resize ──────────────────────────────────────────────────────
+
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!el) return;
+    const obs = new ResizeObserver(([entry]) => {
+      const { width, height } = entry.contentRect;
+      setSize({ w: Math.floor(width), h: Math.floor(height) });
+    });
+    obs.observe(el);
+    return () => obs.disconnect();
+  }, []);
+
+  // ─── Draw ────────────────────────────────────────────────────────
+
+  const drawRef = useRef<() => void>(() => {});
+
+  const draw = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || size.w === 0 || size.h === 0) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = size.w, H = size.h;
+
+    if (canvas.width !== W * dpr || canvas.height !== H * dpr) {
+      canvas.width = W * dpr; canvas.height = H * dpr;
+      canvas.style.width = `${W}px`; canvas.style.height = `${H}px`;
+    }
+
+    const ctx = canvas.getContext('2d')!;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    const vStart = viewStartFrame;
+    const z = zoom;
+    const { major, minor } = getRulerTick(z, fps);
+    const d = drag.current;
+
+    ctx.fillStyle = '#181818';
+    ctx.fillRect(0, 0, W, H);
+
+    // ── Sequence rows ───────────────────────────────────────────
+    for (let i = 0; i < sequences.length; i++) {
+      const seq = sequences[i];
+      const rowTop = getRowTop(i, vertScroll);
+      const rowBot = rowTop + ROW_H;
+      if (rowBot <= RULER_H || rowTop >= H) continue;
+
+      const clipTop = Math.max(RULER_H, rowTop);
+      const clipBot = Math.min(H, rowBot);
+
+      ctx.fillStyle = i % 2 === 0 ? '#1a1a1a' : '#1d1d1d';
+      ctx.fillRect(0, clipTop, W, clipBot - clipTop);
+      ctx.fillStyle = '#282828';
+      ctx.fillRect(0, rowBot - 1, W, 1);
+
+      if (seq.min <= 0 && seq.max >= 0) {
+        const zeroY = valueToY(0, rowTop, seq);
+        if (zeroY > clipTop && zeroY < clipBot) {
+          ctx.setLineDash([3, 4]); ctx.strokeStyle = '#2e2e2e'; ctx.lineWidth = 1;
+          ctx.beginPath(); ctx.moveTo(0, zeroY); ctx.lineTo(W, zeroY); ctx.stroke();
+          ctx.setLineDash([]);
+        }
+      }
+
+      if (!seq.enabled || seq.muted) continue;
+
+      const sorted = [...seq.keyframes].sort((a, b) => a.frame - b.frame);
+      if (sorted.length === 0) continue;
+
+      const firstKf = sorted[0], lastKf = sorted[sorted.length - 1];
+      const startPx = Math.max(-1, frameToX(firstKf.frame, vStart, z));
+      const endPx = Math.min(W + 1, frameToX(lastKf.frame, vStart, z));
+
+      // Curve
+      ctx.save();
+      ctx.beginPath(); ctx.rect(0, clipTop, W, clipBot - clipTop); ctx.clip();
+      ctx.beginPath();
+      ctx.strokeStyle = seq.color; ctx.lineWidth = 1.5; ctx.globalAlpha = 0.85;
+      let started = false;
+      for (let px = Math.floor(startPx) - 1; px <= Math.ceil(endPx) + 1; px++) {
+        const f = xToFrame(px, vStart, z);
+        if (f < firstKf.frame || f > lastKf.frame) continue;
+        const val = interpolateValue(sorted, f);
+        const cy = valueToY(val, rowTop, seq);
+        if (!started) { ctx.moveTo(px, cy); started = true; } else ctx.lineTo(px, cy);
+      }
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      ctx.restore();
+
+      // Bezier handles (for selected bezier kfs)
+      for (let j = 0; j < sorted.length - 1; j++) {
+        const kf = sorted[j];
+        if (kf.interpolation !== 'bezier') continue;
+        const isKfSelected = selectedKeyframes.get(seq.id)?.has(kf.frame) ?? false;
+        const isBzDragging = d.type === 'bz' && d.bzSeqId === seq.id && d.bzFrame === kf.frame;
+        if (!isKfSelected && !isBzDragging) continue;
+
+        const nextKf = sorted[j + 1];
+        const { kx, ky, nkx, nky, h1x, h1y, h2x, h2y } = getBzHandles(kf, nextKf, rowTop, seq, vStart, z);
+
+        ctx.save();
+        ctx.beginPath(); ctx.rect(0, clipTop - BZ_R * 2, W, clipBot - clipTop + BZ_R * 4); ctx.clip();
+
+        // Lines from anchors to handles
+        ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([2, 3]);
+        ctx.beginPath();
+        ctx.moveTo(kx, ky); ctx.lineTo(h1x, h1y);
+        ctx.moveTo(nkx, nky); ctx.lineTo(h2x, h2y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Handle circles
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = '#fff';
+        ctx.fillStyle = '#60a5fa';
+        ctx.beginPath(); ctx.arc(h1x, h1y, BZ_R, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+        ctx.beginPath(); ctx.arc(h2x, h2y, BZ_R, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+        ctx.restore();
+      }
+
+      // Keyframe diamonds
+      for (const kf of sorted) {
+        const kx = frameToX(kf.frame, vStart, z);
+        if (kx < -KF_HALF - 1 || kx > W + KF_HALF + 1) continue;
+        const ky = clamp(valueToY(kf.value, rowTop, seq), clipTop + KF_HALF, clipBot - KF_HALF);
+        const isSelected = selectedKeyframes.get(seq.id)?.has(kf.frame) ?? false;
+
+        ctx.save();
+        ctx.translate(kx, ky);
+        ctx.beginPath();
+        ctx.moveTo(0, -KF_HALF); ctx.lineTo(KF_HALF, 0);
+        ctx.lineTo(0, KF_HALF); ctx.lineTo(-KF_HALF, 0);
+        ctx.closePath();
+        if (isSelected) {
+          ctx.fillStyle = '#ffffff'; ctx.strokeStyle = seq.color; ctx.lineWidth = 1.5;
+          ctx.fill(); ctx.stroke();
+        } else {
+          ctx.fillStyle = seq.color; ctx.strokeStyle = 'rgba(0,0,0,0.3)'; ctx.lineWidth = 1;
+          ctx.fill(); ctx.stroke();
+        }
+        ctx.restore();
+      }
+    }
+
+    // ── Grid lines ─────────────────────────────────────────────
+    ctx.strokeStyle = '#222'; ctx.lineWidth = 1;
+    const firstMajor = Math.ceil(vStart / major) * major;
+    for (let f = firstMajor; frameToX(f, vStart, z) <= W; f += major) {
+      const x = frameToX(f, vStart, z);
+      ctx.beginPath(); ctx.moveTo(x + 0.5, RULER_H); ctx.lineTo(x + 0.5, H); ctx.stroke();
+    }
+
+    const durX = Math.round(frameToX(durationFrames, vStart, z));
+    if (durX >= 0 && durX <= W) {
+      ctx.strokeStyle = '#505050'; ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.moveTo(durX + 0.5, RULER_H); ctx.lineTo(durX + 0.5, H); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    // ── Ruler ──────────────────────────────────────────────────
+    ctx.fillStyle = '#1e1e1e'; ctx.fillRect(0, 0, W, RULER_H);
+    ctx.fillStyle = '#2a2a2a'; ctx.fillRect(0, RULER_H - 1, W, 1);
+    ctx.font = `10px ui-monospace, 'SF Mono', Menlo, monospace`;
+    ctx.textBaseline = 'middle';
+
+    const firstMinor = Math.ceil(vStart / minor) * minor;
+    for (let f = firstMinor; frameToX(f, vStart, z) <= W; f += minor) {
+      const x = frameToX(f, vStart, z);
+      ctx.fillStyle = '#3a3a3a'; ctx.fillRect(Math.round(x), RULER_H - 5, 1, 4);
+    }
+    for (let f = firstMajor; frameToX(f, vStart, z) <= W; f += major) {
+      const x = frameToX(f, vStart, z);
+      ctx.fillStyle = '#555'; ctx.fillRect(Math.round(x), RULER_H - 10, 1, 9);
+      ctx.fillStyle = '#888';
+      ctx.textAlign = x < 24 ? 'left' : 'center';
+      ctx.fillText(formatRulerLabel(f, fps), x, RULER_H / 2 - 1);
+    }
+
+    // ── Playhead ───────────────────────────────────────────────
+    const phX = Math.round(frameToX(currentFrame, vStart, z));
+    if (phX >= -1 && phX <= W + 1) {
+      ctx.strokeStyle = '#ef4444'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(phX + 0.5, 0); ctx.lineTo(phX + 0.5, H); ctx.stroke();
+      ctx.fillStyle = '#ef4444';
+      ctx.beginPath();
+      ctx.moveTo(phX - 5, 0); ctx.lineTo(phX + 6, 0); ctx.lineTo(phX + 0.5, 11);
+      ctx.closePath(); ctx.fill();
+    }
+
+    // ── Snap indicator ─────────────────────────────────────────
+    if ((d.type === 'kf') && d.snapTargetFrame !== undefined) {
+      const snapX = frameToX(d.snapTargetFrame, vStart, z);
+      ctx.save();
+      ctx.strokeStyle = '#4ade80'; ctx.lineWidth = 1;
+      ctx.setLineDash([4, 3]); ctx.globalAlpha = 0.8;
+      ctx.beginPath(); ctx.moveTo(snapX + 0.5, RULER_H); ctx.lineTo(snapX + 0.5, H); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = '#4ade80'; ctx.globalAlpha = 1;
+      ctx.beginPath();
+      ctx.moveTo(snapX, RULER_H); ctx.lineTo(snapX + 5, RULER_H + 8);
+      ctx.lineTo(snapX, RULER_H + 16); ctx.lineTo(snapX - 5, RULER_H + 8);
+      ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+
+    // ── Marquee ────────────────────────────────────────────────
+    if (d.type === 'marquee' && d.curX !== undefined && d.curY !== undefined) {
+      const rx = Math.min(d.startX, d.curX), ry = Math.min(d.startY, d.curY);
+      const rw = Math.abs(d.curX - d.startX), rh = Math.abs(d.curY - d.startY);
+      ctx.fillStyle = 'rgba(59,130,246,0.07)'; ctx.fillRect(rx, ry, rw, rh);
+      ctx.strokeStyle = 'rgba(59,130,246,0.55)'; ctx.lineWidth = 1;
+      ctx.strokeRect(rx + 0.5, ry + 0.5, rw, rh);
+    }
+  }, [size, sequences, fps, durationFrames, currentFrame, viewStartFrame, zoom, selectedKeyframes, vertScroll]);
+
+  useEffect(() => { drawRef.current = draw; }, [draw]);
+  useEffect(() => { if (!isPlaying) draw(); }, [draw, isPlaying]);
+
+  useEffect(() => {
+    if (!isPlaying) return;
+    let raf: number;
+    const loop = () => { drawRef.current(); raf = requestAnimationFrame(loop); };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, [isPlaying]);
+
+  // ─── Helpers ────────────────────────────────────────────────────
+
+  const getXY = (e: React.MouseEvent) => {
+    const rect = canvasRef.current!.getBoundingClientRect();
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  };
+
+  // ─── Context menu close on outside click ──────────────────────
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const handler = (e: MouseEvent) => {
+      const menu = document.querySelector('[data-kf-menu]');
+      if (menu?.contains(e.target as Node)) return;
+      setContextMenu(null);
+    };
+    window.addEventListener('mousedown', handler, true);
+    return () => window.removeEventListener('mousedown', handler, true);
+  }, [contextMenu]);
+
+  // ─── Mouse down ──────────────────────────────────────────────────
+
+  const handleMouseDown = useCallback(
+    (e: React.MouseEvent) => {
+      if (e.button !== 0) return;
+      setContextMenu(null);
+      const { x, y } = getXY(e);
+      const vStart = viewStartFrame, z = zoom;
+
+      // Ruler seek
+      if (y < RULER_H) {
+        const frame = clamp(Math.round(xToFrame(x, vStart, z)), 0, durationFrames);
+        setCurrentFrame(frame);
+        drag.current = { type: 'seek', startX: x, startY: y, startViewStart: vStart };
+        setCursor('col-resize');
+        return;
+      }
+
+      // Hit test bezier handles first (only if kf is selected)
+      const bzHit = hitTestBzHandle(x, y, sequences, vStart, z, vertScroll, useAppStore.getState().selectedKeyframes);
+      if (bzHit) {
+        drag.current = {
+          type: 'bz', startX: x, startY: y, startViewStart: vStart,
+          bzSeqId: bzHit.seqId, bzFrame: bzHit.frame,
+          bzHandle: bzHit.handle, bzNextFrame: bzHit.nextFrame,
+        };
+        setCursor('crosshair');
+        return;
+      }
+
+      // Hit test keyframes
+      const hit = hitTestKeyframe(x, y, sequences, vStart, z, vertScroll);
+      if (hit) {
+        const currentSel = useAppStore.getState().selectedKeyframes;
+        const clickedIsSelected = currentSel.get(hit.seqId)?.has(hit.frame) ?? false;
+        const totalSelected = [...currentSel.values()].reduce((s, set) => s + set.size, 0);
+        const isMultiDrag = clickedIsSelected && totalSelected > 1 && !e.shiftKey && !e.metaKey && !e.ctrlKey;
+
+        if (isMultiDrag) {
+          // Multi-drag: collect all selected kf positions
+          const freshSeqs = useAppStore.getState().project.sequences;
+          const positions: MultiInitPos[] = [];
+          const excludeFrames = new Set<number>();
+          for (const [sid, frames] of currentSel) {
+            const seq = freshSeqs.find((s) => s.id === sid);
+            if (!seq) continue;
+            for (const f of frames) {
+              const kf = seq.keyframes.find((k) => k.frame === f);
+              if (kf) { positions.push({ seqId: sid, frame: f, value: kf.value }); excludeFrames.add(f); }
+            }
+          }
+          drag.current = {
+            type: 'kf', startX: x, startY: y, startViewStart: vStart,
+            kfSeqId: hit.seqId, kfSeqIndex: hit.seqIndex, kfCurFrame: hit.frame,
+            kfMultiInitPositions: positions, kfAnchorInitFrame: hit.frame, kfPrevDelta: 0,
+          };
+        } else {
+          const multi = e.shiftKey || e.metaKey || e.ctrlKey;
+          setSelectedSequence(hit.seqId);
+          toggleKeyframeSelection(hit.seqId, hit.frame, multi);
+          drag.current = {
+            type: 'kf', startX: x, startY: y, startViewStart: vStart,
+            kfSeqId: hit.seqId, kfSeqIndex: hit.seqIndex, kfCurFrame: hit.frame,
+          };
+        }
+        setCursor('grab');
+        return;
+      }
+
+      // Row selection
+      const rowIndex = Math.floor((y - RULER_H + vertScroll) / ROW_H);
+      if (rowIndex >= 0 && rowIndex < sequences.length) {
+        setSelectedSequence(sequences[rowIndex].id);
+      }
+
+      if (e.altKey) {
+        drag.current = { type: 'pan', startX: x, startY: y, startViewStart: vStart };
+        setCursor('grabbing');
+        return;
+      }
+
+      if (!e.shiftKey) clearKeyframeSelection();
+      drag.current = { type: 'marquee', startX: x, startY: y, startViewStart: vStart, curX: x, curY: y };
+      setCursor('crosshair');
+    },
+    [sequences, viewStartFrame, zoom, vertScroll, durationFrames,
+     setCurrentFrame, setSelectedSequence, toggleKeyframeSelection, clearKeyframeSelection]
+  );
+
+  // ─── Mouse move ──────────────────────────────────────────────────
+
+  const handleMouseMove = useCallback(
+    (e: React.MouseEvent) => {
+      const d = drag.current;
+      if (d.type === 'idle') return;
+      const { x, y } = getXY(e);
+      const z = zoom;
+
+      if (d.type === 'seek') {
+        setCurrentFrame(clamp(Math.round(xToFrame(x, viewStartFrame, z)), 0, durationFrames));
+        return;
+      }
+
+      if (d.type === 'bz' && d.bzSeqId && d.bzFrame !== undefined && d.bzNextFrame !== undefined && d.bzHandle) {
+        const freshSeqs = useAppStore.getState().project.sequences;
+        const seqIdx = freshSeqs.findIndex((s) => s.id === d.bzSeqId);
+        if (seqIdx < 0) return;
+        const seq = freshSeqs[seqIdx];
+        const kf = seq.keyframes.find((k) => k.frame === d.bzFrame);
+        const nextKf = seq.keyframes.find((k) => k.frame === d.bzNextFrame);
+        if (!kf || !nextKf) return;
+
+        const frameSpan = nextKf.frame - kf.frame;
+        const valueSpan = nextKf.value - kf.value;
+        const mouseFrame = xToFrame(x, viewStartFrame, z);
+        const mouseValue = yToValue(y, getRowTop(seqIdx, vertScroll), seq);
+
+        const normX = frameSpan > 0 ? clamp((mouseFrame - kf.frame) / frameSpan, 0, 1) : 0;
+        const normY = Math.abs(valueSpan) > 1e-10 ? (mouseValue - kf.value) / valueSpan : 0;
+
+        if (d.bzHandle === 'cp1') {
+          updateKeyframe(d.bzSeqId, d.bzFrame, { cp1x: normX, cp1y: normY });
+        } else {
+          updateKeyframe(d.bzSeqId, d.bzFrame, { cp2x: normX, cp2y: normY });
+        }
+        drawRef.current();
+        return;
+      }
+
+      if (d.type === 'kf' && d.kfSeqId != null && d.kfSeqIndex != null) {
+        const freshSeqs = useAppStore.getState().project.sequences;
+        const seq = freshSeqs.find((s) => s.id === d.kfSeqId);
+        if (!seq || seq.locked) return;
+
+        const rawFrame = clamp(Math.round(xToFrame(x, viewStartFrame, z)), 0, durationFrames);
+
+        // Sticky snap
+        let finalFrame: number;
+        let isSnapped: boolean;
+
+        const gridSize = useAppStore.getState().snapGridSize;
+
+        // Single-kf: exclude same-seq kfs from snap (prevents accidental overwrite)
+        // Multi-drag: exclude the currently dragged frames globally
+        const snapOpts = d.kfMultiInitPositions
+          ? {
+              excludeFrames: new Set(d.kfMultiInitPositions.map((p) => p.frame + (d.kfPrevDelta ?? 0))),
+              gridSize,
+            }
+          : { excludeSeqId: d.kfSeqId, gridSize };
+
+        if (d.snapLocked !== undefined) {
+          const pixelDist = Math.abs(rawFrame - d.snapLocked) / z;
+          if (pixelDist <= SNAP_PX) {
+            finalFrame = d.snapLocked; isSnapped = true;
+          } else {
+            const r = getSnappedFrame(rawFrame, freshSeqs, z, snapOpts);
+            finalFrame = r.frame; isSnapped = r.snapped;
+          }
+        } else {
+          const r = getSnappedFrame(rawFrame, freshSeqs, z, snapOpts);
+          finalFrame = r.frame; isSnapped = r.snapped;
+        }
+
+        if (d.kfMultiInitPositions) {
+          // Multi-drag: move all selected kfs by same frame delta
+          const frameDelta = finalFrame - d.kfAnchorInitFrame!;
+          if (frameDelta !== d.kfPrevDelta) {
+            const prevDelta = d.kfPrevDelta ?? 0;
+            const moves = d.kfMultiInitPositions.map((p) => ({
+              seqId: p.seqId,
+              fromFrame: clamp(p.frame + prevDelta, 0, durationFrames),
+              toFrame: clamp(p.frame + frameDelta, 0, durationFrames),
+              value: p.value,
+            }));
+            moveKeyframesBatch(moves);
+            drag.current = {
+              ...d,
+              kfCurFrame: finalFrame,
+              kfPrevDelta: frameDelta,
+              snapLocked: isSnapped ? finalFrame : undefined,
+              snapTargetFrame: isSnapped ? finalFrame : undefined,
+            };
+          }
+        } else {
+          // Single kf drag
+          // Collision guard: don't move onto a frame already occupied by another kf
+          const wouldCollide = finalFrame !== d.kfCurFrame! &&
+            seq.keyframes.some((k) => k.frame === finalFrame);
+          if (wouldCollide) {
+            drag.current = { ...d, snapLocked: undefined, snapTargetFrame: undefined };
+            drawRef.current();
+            return;
+          }
+          const rowTop = getRowTop(d.kfSeqIndex, vertScroll);
+          const newValue = clamp(yToValue(y, rowTop, seq), seq.min, seq.max);
+          moveKeyframe(d.kfSeqId, d.kfCurFrame!, finalFrame, newValue);
+          drag.current = {
+            ...d,
+            kfCurFrame: finalFrame,
+            snapLocked: isSnapped ? finalFrame : undefined,
+            snapTargetFrame: isSnapped ? finalFrame : undefined,
+          };
+        }
+        drawRef.current();
+        return;
+      }
+
+      if (d.type === 'marquee') {
+        drag.current = { ...d, curX: x, curY: y };
+        drawRef.current();
+        return;
+      }
+
+      if (d.type === 'pan') {
+        const delta = (x - d.startX) * z;
+        setViewStartFrame(d.startViewStart - delta);
+      }
+    },
+    [viewStartFrame, zoom, vertScroll, durationFrames,
+     setCurrentFrame, setViewStartFrame, moveKeyframe, moveKeyframesBatch, updateKeyframe]
+  );
+
+  // ─── Mouse up ────────────────────────────────────────────────────
+
+  const handleMouseUp = useCallback(
+    (e: React.MouseEvent) => {
+      const d = drag.current;
+
+      // Sync selectedKeyframes after multi-drag
+      if (d.type === 'kf' && d.kfMultiInitPositions && d.kfPrevDelta !== undefined) {
+        const delta = d.kfPrevDelta;
+        const newSel = new Map<string, Set<number>>();
+        for (const p of d.kfMultiInitPositions) {
+          const frames = newSel.get(p.seqId) ?? new Set<number>();
+          frames.add(clamp(p.frame + delta, 0, durationFrames));
+          newSel.set(p.seqId, frames);
+        }
+        setSelectedKeyframesBatch(newSel);
+      }
+
+      if (d.type === 'marquee' && d.curX !== undefined && d.curY !== undefined) {
+        const mx1 = Math.min(d.startX, d.curX), mx2 = Math.max(d.startX, d.curX);
+        const my1 = Math.min(d.startY, d.curY), my2 = Math.max(d.startY, d.curY);
+        const vStart = viewStartFrame, z = zoom;
+        const addMode = e.shiftKey || e.metaKey || e.ctrlKey;
+
+        const batch = new Map<string, Set<number>>(
+          addMode ? useAppStore.getState().selectedKeyframes : new Map()
+        );
+        let firstSeqId: string | null = null;
+
+        for (let i = 0; i < sequences.length; i++) {
+          const seq = sequences[i];
+          const rowTop = getRowTop(i, vertScroll);
+          for (const kf of seq.keyframes) {
+            const kx = frameToX(kf.frame, vStart, z);
+            const ky = valueToY(kf.value, rowTop, seq);
+            if (kx >= mx1 && kx <= mx2 && ky >= my1 && ky <= my2) {
+              const frames = batch.get(seq.id) ?? new Set<number>();
+              frames.add(kf.frame);
+              batch.set(seq.id, frames);
+              if (!firstSeqId) firstSeqId = seq.id;
+            }
+          }
+        }
+        setSelectedKeyframesBatch(batch);
+        if (firstSeqId) setSelectedSequence(firstSeqId);
+      }
+
+      drag.current = { type: 'idle', startX: 0, startY: 0, startViewStart: 0 };
+      setCursor('crosshair');
+      drawRef.current();
+    },
+    [sequences, viewStartFrame, zoom, vertScroll, durationFrames,
+     setSelectedKeyframesBatch, setSelectedSequence]
+  );
+
+  // ─── Right-click context menu ─────────────────────────────────────
+
+  const handleContextMenu = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      const { x, y } = getXY(e);
+      if (y < RULER_H) return;
+      const hit = hitTestKeyframe(x, y, sequences, viewStartFrame, zoom, vertScroll);
+      if (!hit) return;
+      const seq = sequences.find((s) => s.id === hit.seqId);
+      const kf = seq?.keyframes.find((k) => k.frame === hit.frame);
+      if (!kf) return;
+      const rect = wrapRef.current!.getBoundingClientRect();
+      setContextMenu({
+        x: e.clientX - rect.left,
+        y: e.clientY - rect.top,
+        seqId: hit.seqId,
+        frame: hit.frame,
+        interp: kf.interpolation,
+      });
+    },
+    [sequences, viewStartFrame, zoom, vertScroll]
+  );
+
+  // ─── Double click → add keyframe ────────────────────────────────
+
+  const handleDoubleClick = useCallback(
+    (e: React.MouseEvent) => {
+      const { x, y } = getXY(e);
+      if (y < RULER_H) return;
+      const rowIndex = Math.floor((y - RULER_H + vertScroll) / ROW_H);
+      if (rowIndex < 0 || rowIndex >= sequences.length) return;
+      const seq = sequences[rowIndex];
+      if (seq.locked) return;
+      const frame = clamp(Math.round(xToFrame(x, viewStartFrame, zoom)), 0, durationFrames);
+      const rowTop = getRowTop(rowIndex, vertScroll);
+      const value = clamp(yToValue(y, rowTop, seq), seq.min, seq.max);
+      addKeyframe(seq.id, { frame, value, interpolation: 'linear' });
+      setSelectedSequence(seq.id);
+    },
+    [sequences, viewStartFrame, zoom, vertScroll, durationFrames, addKeyframe, setSelectedSequence]
+  );
+
+  // ─── Wheel ──────────────────────────────────────────────────────
+
+  const handleWheel = useCallback(
+    (e: React.WheelEvent) => {
+      e.preventDefault();
+      const { x } = getXY(e);
+      const pivotFrame = xToFrame(x, viewStartFrame, zoom);
+      if (e.ctrlKey || e.metaKey) {
+        const factor = e.deltaY > 0 ? 1.12 : 1 / 1.12;
+        setZoom(zoom * factor, pivotFrame);
+      } else if (e.shiftKey) {
+        const maxV = Math.max(0, sequences.length * ROW_H - (size.h - RULER_H));
+        setVertScroll((s) => clamp(s + e.deltaY * 0.5, 0, maxV));
+      } else {
+        const delta = e.deltaX !== 0 ? e.deltaX : e.deltaY;
+        setViewStartFrame(viewStartFrame + delta * zoom * 0.4);
+      }
+    },
+    [viewStartFrame, zoom, sequences.length, size.h, setZoom, setViewStartFrame]
+  );
+
+  // ─── Keyboard: delete / copy / paste ────────────────────────────
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement;
+      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') return;
+
+      // Delete
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        const { removeKeyframe, selectedKeyframes: sel, project: proj, clearKeyframeSelection: clearSel } = useAppStore.getState();
+        for (const [sid, frames] of sel) {
+          const seq = proj.sequences.find((s) => s.id === sid);
+          if (!seq || seq.locked) continue;
+          frames.forEach((f) => removeKeyframe(sid, f));
+        }
+        clearSel();
+        return;
+      }
+
+      // Copy (Cmd+C / Ctrl+C)
+      if ((e.metaKey || e.ctrlKey) && e.key === 'c') {
+        const { selectedKeyframes: sel, project: proj } = useAppStore.getState();
+        const entries: ClipEntry[] = [];
+        let minFrame = Infinity;
+        for (const [sid, frames] of sel) {
+          const seq = proj.sequences.find((s) => s.id === sid);
+          if (!seq) continue;
+          for (const f of frames) {
+            const kf = seq.keyframes.find((k) => k.frame === f);
+            if (kf) { entries.push({ seqId: sid, relFrame: f, kf: { ...kf } }); if (f < minFrame) minFrame = f; }
+          }
+        }
+        if (entries.length > 0) {
+          kfClipboard = entries.map((en) => ({ ...en, relFrame: en.relFrame - minFrame }));
+        }
+        return;
+      }
+
+      // Paste (Cmd+V / Ctrl+V)
+      if ((e.metaKey || e.ctrlKey) && e.key === 'v') {
+        if (kfClipboard.length === 0) return;
+        const { selectedSequenceId: sid, currentFrame: cf, addKeyframes: addKfs } = useAppStore.getState();
+        if (!sid) return;
+        const kfsToAdd = kfClipboard.map((en) => ({ ...en.kf, frame: cf + en.relFrame }));
+        addKfs(sid, kfsToAdd);
+        return;
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, []);
+
+  // ─── Render ─────────────────────────────────────────────────────
+
+  const GRID_OPTIONS = [
+    { label: 'Off', value: 0 },
+    { label: '1f',  value: 1 },
+    { label: '5f',  value: 5 },
+    { label: '10f', value: 10 },
+    { label: '15f', value: 15 },
+    { label: '30f', value: 30 },
+    { label: '60f', value: 60 },
+  ];
+
+  return (
+    <div ref={wrapRef} className="flex-1 overflow-hidden relative bg-[#181818]">
+      <canvas
+        ref={canvasRef}
+        className="absolute inset-0 block"
+        style={{ cursor }}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
+        onMouseLeave={handleMouseUp}
+        onDoubleClick={handleDoubleClick}
+        onContextMenu={handleContextMenu}
+        onWheel={handleWheel}
+      />
+
+      {/* ── Snap grid control ── */}
+      <div className="absolute bottom-2 right-2 z-30 flex items-center gap-1.5 bg-[#1e1e1e]/80 backdrop-blur border border-[#333] rounded px-2 py-1">
+        <span className="text-[10px] text-[#555] font-mono select-none">SNAP</span>
+        <div className="flex gap-px">
+          {GRID_OPTIONS.map(({ label, value }) => (
+            <button
+              key={value}
+              className={`px-1.5 py-0.5 text-[10px] font-mono rounded transition-colors ${
+                snapGridSize === value
+                  ? 'bg-[#4ade80] text-black font-bold'
+                  : 'text-[#555] hover:text-[#aaa]'
+              }`}
+              onMouseDown={(e) => { e.preventDefault(); setSnapGridSize(value); }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* ── Right-click context menu ── */}
+      {contextMenu && (
+        <div
+          data-kf-menu
+          className="absolute z-50 bg-[#252525] border border-[#4a4a4a] rounded-lg shadow-xl py-1 min-w-[120px]"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+        >
+          {INTERP_OPTIONS.map(({ value, label }) => (
+            <button
+              key={value}
+              className={`w-full text-left px-3 py-1.5 text-[12px] flex items-center gap-2 transition-colors ${
+                contextMenu.interp === value
+                  ? 'text-[#4ade80] font-semibold'
+                  : 'text-[#aaa] hover:text-white hover:bg-[#333]'
+              }`}
+              onMouseDown={(ev) => {
+                ev.preventDefault();
+                updateKeyframe(contextMenu.seqId, contextMenu.frame, { interpolation: value });
+                setContextMenu(null);
+              }}
+            >
+              <InterpMini type={value} active={contextMenu.interp === value} />
+              {label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Tiny SVG curve icons ─────────────────────────────────────────────
+
+function InterpMini({ type, active }: { type: Interpolation; active: boolean }) {
+  const color = active ? '#4ade80' : 'currentColor';
+  return (
+    <svg width="18" height="12" viewBox="0 0 18 12" style={{ flexShrink: 0 }}>
+      {type === 'step' && (
+        <path d="M1 10 H8 V2 H17" fill="none" stroke={color} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      )}
+      {type === 'linear' && (
+        <line x1="1" y1="10" x2="17" y2="2" stroke={color} strokeWidth="1.8" strokeLinecap="round" />
+      )}
+      {type === 'smooth' && (
+        <path d="M1 10 C5 10 13 2 17 2" fill="none" stroke={color} strokeWidth="1.8" strokeLinecap="round" />
+      )}
+      {type === 'bezier' && (
+        <path d="M1 10 C3 10 6 2 17 2" fill="none" stroke={color} strokeWidth="1.8" strokeLinecap="round" />
+      )}
+    </svg>
+  );
+}

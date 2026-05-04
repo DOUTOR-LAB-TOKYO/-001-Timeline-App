@@ -1,12 +1,12 @@
 [package]
-name = "tauri-app"
+name = "score"
 version = "0.1.0"
 description = "Score — Timeline Sequencer"
 authors = ["you"]
 edition = "2021"
 
 [lib]
-name = "tauri_app_lib"
+name = "score_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

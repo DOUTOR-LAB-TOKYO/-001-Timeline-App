@@ -26,6 +26,8 @@ pub struct Sequence {
     pub color: String,
     #[serde(rename = "oscAddress")]
     pub osc_address: String,
+    #[serde(rename = "dmxChannel", default)]
+    pub dmx_channel: u16, // 0 = disabled, 1-512 = DMX channel
     #[serde(rename = "valueType", default = "default_value_type")]
     pub value_type: String,
     pub min: f64,
@@ -47,6 +49,20 @@ pub struct OscConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerialConfig {
+    pub port: String,
+    #[serde(rename = "baudRate")]
+    pub baud_rate: u32,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DmxConfig {
+    pub port: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     #[serde(rename = "projectName")]
     pub project_name: String,
@@ -60,6 +76,10 @@ pub struct Project {
     pub sequences: Vec<Sequence>,
     #[serde(rename = "oscConfig")]
     pub osc_config: OscConfig,
+    #[serde(rename = "serialConfig")]
+    pub serial_config: SerialConfig,
+    #[serde(rename = "dmxConfig")]
+    pub dmx_config: DmxConfig,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -20,6 +20,7 @@ export interface Sequence {
   locked: boolean;
   color: string;
   oscAddress: string;
+  dmxChannel: number; // 0 = disabled, 1-512
   valueType: 'float' | 'int';
   min: number;
   max: number;
@@ -33,6 +34,17 @@ export interface OscConfig {
   enabled: boolean;
 }
 
+export interface SerialConfig {
+  port: string;
+  baudRate: number;
+  enabled: boolean;
+}
+
+export interface DmxConfig {
+  port: string;
+  enabled: boolean;
+}
+
 export interface Project {
   projectName: string;
   fps: number;
@@ -41,6 +53,8 @@ export interface Project {
   videoFile: string | null;
   sequences: Sequence[];
   oscConfig: OscConfig;
+  serialConfig: SerialConfig;
+  dmxConfig: DmxConfig;
 }
 
 export interface LogEntry {

@@ -1,6 +1,9 @@
+use crate::dmx::send_dmx;
 use crate::interpolation::interpolate;
 use crate::osc::send_osc_f32;
+use crate::serial::send_serial;
 use crate::types::{FrameUpdatePayload, Project};
+use serialport::SerialPort;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -28,8 +31,17 @@ impl EngineState {
     }
 }
 
-pub fn start(state: &EngineState, app: AppHandle, project: Project, start_frame: i64) {
-    // Stop any existing playback
+pub fn start(
+    state: &EngineState,
+    app: AppHandle,
+    project: Project,
+    start_frame: i64,
+    loop_enabled: bool,
+    loop_in: i64,
+    loop_out: i64,
+    serial_port: Arc<Mutex<Option<Box<dyn SerialPort>>>>,
+    dmx_port: Arc<Mutex<Option<Box<dyn SerialPort>>>>,
+) {
     stop(state);
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
@@ -48,28 +60,36 @@ pub fn start(state: &EngineState, app: AppHandle, project: Project, start_frame:
         let duration_frames = project.duration_frames;
         let frame_duration = Duration::from_secs_f64(1.0 / fps);
 
-        let start_instant = Instant::now();
+        let mut start_instant_ref = Instant::now();
+        let mut start_frame_ref = start_frame;
         let mut frame_offset: i64 = 0;
 
         loop {
-            // Check stop signal
             if rx.try_recv().is_ok() {
                 break;
             }
 
             frame_offset += 1;
-            let current_frame = start_frame + frame_offset;
+            let current_frame = start_frame_ref + frame_offset;
 
-            // End of timeline
-            if current_frame > duration_frames {
-                let mut inner = inner_arc.lock().unwrap();
-                inner.is_playing = false;
-                inner.current_frame = duration_frames;
-                let _ = app.emit("playback_stopped", ());
-                break;
+            // Loop or end-of-timeline
+            let end = if loop_enabled { loop_out.min(duration_frames) } else { duration_frames };
+            if current_frame > end {
+                if loop_enabled {
+                    // Restart from loop_in
+                    frame_offset = 0;
+                    start_frame_ref = loop_in;
+                    start_instant_ref = Instant::now();
+                    continue;
+                } else {
+                    let mut inner = inner_arc.lock().unwrap();
+                    inner.is_playing = false;
+                    inner.current_frame = duration_frames;
+                    let _ = app.emit("playback_stopped", ());
+                    break;
+                }
             }
 
-            // Compute interpolated values for all enabled, non-muted sequences
             let mut values: HashMap<String, f64> = HashMap::new();
             for seq in &project.sequences {
                 if !seq.enabled || seq.muted || seq.keyframes.is_empty() {
@@ -80,7 +100,6 @@ pub fn start(state: &EngineState, app: AppHandle, project: Project, start_frame:
                 values.insert(seq.id.clone(), val);
             }
 
-            // Emit frame update to frontend
             let _ = app.emit(
                 "frame_update",
                 FrameUpdatePayload {
@@ -106,22 +125,56 @@ pub fn start(state: &EngineState, app: AppHandle, project: Project, start_frame:
                 }
             }
 
-            // Update state
+            // Send DMX (ENTTEC Pro): build 512-ch universe from dmxChannel assignments
+            if project.dmx_config.enabled {
+                let mut universe = [0u8; 512];
+                for seq in &project.sequences {
+                    if !seq.enabled || seq.muted || seq.dmx_channel == 0 {
+                        continue;
+                    }
+                    let ch = (seq.dmx_channel as usize).saturating_sub(1); // 1-based → 0-based
+                    if ch < 512 {
+                        if let Some(&val) = values.get(&seq.id) {
+                            let range = seq.max - seq.min;
+                            let norm = if range.abs() > f64::EPSILON {
+                                (val - seq.min) / range
+                            } else { 0.0 };
+                            universe[ch] = (norm.clamp(0.0, 1.0) * 255.0).round() as u8;
+                        }
+                    }
+                }
+                send_dmx(&dmx_port, &universe);
+            }
+
+            // Send Serial: "<address>:<value>\n" per sequence
+            if project.serial_config.enabled {
+                for seq in &project.sequences {
+                    if !seq.enabled || seq.muted {
+                        continue;
+                    }
+                    if let Some(&val) = values.get(&seq.id) {
+                        let msg = if seq.value_type == "int" {
+                            format!("{}:{}\n", seq.osc_address, val as i64)
+                        } else {
+                            format!("{}:{:.4}\n", seq.osc_address, val)
+                        };
+                        send_serial(&serial_port, &msg);
+                    }
+                }
+            }
+
             {
                 let mut inner = inner_arc.lock().unwrap();
                 inner.current_frame = current_frame;
             }
 
-            // Precise timing: sleep until the next frame's target time
-            let target = start_instant + frame_duration.mul_f64(frame_offset as f64);
+            let target = start_instant_ref + frame_duration.mul_f64(frame_offset as f64);
             let now = Instant::now();
             if target > now {
                 let remaining = target - now;
-                // Coarse sleep for most of the wait, spin for the last bit
                 if remaining > Duration::from_micros(200) {
                     spin_sleep::sleep(remaining - Duration::from_micros(100));
                 }
-                // Spin the rest
                 while Instant::now() < target {
                     std::hint::spin_loop();
                 }

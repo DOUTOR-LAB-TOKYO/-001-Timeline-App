@@ -1,5 +1,7 @@
 import { useRef, useEffect, useCallback, useState } from 'react';
 import { useAppStore } from '../store';
+import { useT, translations } from '../lib/i18n';
+import { nameToOscAddress } from '../lib/utils';
 import type { Interpolation } from '../types';
 
 // ─── Bezier Editor ────────────────────────────────────────────────────
@@ -275,14 +277,15 @@ function NumInput({ label, value, min, max, step = 1, onCommit }: NumInputProps)
 export default function PropertiesPanel() {
   const selectedId = useAppStore((s) => s.selectedSequenceId);
   const sequences = useAppStore((s) => s.project.sequences);
+  const projectName = useAppStore((s) => s.project.projectName);
   const selectedKeyframes = useAppStore((s) => s.selectedKeyframes);
+  const language = useAppStore((s) => s.language);
   const updateSequence = useAppStore((s) => s.updateSequence);
   const updateKeyframe = useAppStore((s) => s.updateKeyframe);
   const removeKeyframe = useAppStore((s) => s.removeKeyframe);
-  const oscConfig = useAppStore((s) => s.project.oscConfig);
-  const updateProject = useAppStore((s) => s.updateProject);
   const fps = useAppStore((s) => s.project.fps);
   const durationFrames = useAppStore((s) => s.project.durationFrames);
+  const t = useT();
 
   const seq = sequences.find((s) => s.id === selectedId);
   const selKfFrames = selectedId ? [...(selectedKeyframes.get(selectedId) ?? [])] : [];
@@ -302,7 +305,7 @@ export default function PropertiesPanel() {
               <input
                 type="text"
                 value={seq.name}
-                onChange={(e) => updateSequence(seq.id, { name: e.target.value })}
+                onChange={(e) => updateSequence(seq.id, { name: e.target.value, oscAddress: nameToOscAddress(e.target.value) })}
                 onKeyDown={(e) => e.stopPropagation()}
                 className="w-full"
               />
@@ -322,11 +325,33 @@ export default function PropertiesPanel() {
                 onKeyDown={(e) => e.stopPropagation()}
                 className="w-full font-mono text-xs"
               />
+              <span className="font-mono text-[10px] text-[#4ade80] truncate">
+                {nameToOscAddress(projectName || 'tab')}{seq.oscAddress.startsWith('/') ? seq.oscAddress : '/' + seq.oscAddress}
+              </span>
             </Field>
-            {/* Value type toggle */}
+            <Field label="DMX Channel">
+              <div className="flex items-center gap-1">
+                <input
+                  type="number"
+                  value={seq.dmxChannel === 0 ? '' : seq.dmxChannel}
+                  placeholder="0 = off"
+                  min={0}
+                  max={512}
+                  onChange={(e) => {
+                    const v = parseInt(e.target.value, 10);
+                    updateSequence(seq.id, { dmxChannel: isNaN(v) ? 0 : Math.min(512, Math.max(0, v)) });
+                  }}
+                  onKeyDown={(e) => e.stopPropagation()}
+                  className="w-full font-mono text-xs"
+                />
+                {seq.dmxChannel > 0 && (
+                  <span className="text-[10px] text-[#4ade80] shrink-0">ch{seq.dmxChannel}</span>
+                )}
+              </div>
+            </Field>
             <Field label="Value Type">
               <div className="flex rounded overflow-hidden border border-[#3d3d3d]">
-                {(['float', 'int'] as const).map((t) => (
+                {(['int', 'float'] as const).map((t) => (
                   <button
                     key={t}
                     onClick={() => updateSequence(seq.id, { valueType: t })}
@@ -357,7 +382,7 @@ export default function PropertiesPanel() {
             </Field>
           </div>
         ) : (
-          <p className="text-[#555] text-xs">シーケンスを選択</p>
+          <p className="text-[#555] text-xs">{t('selectSequence')}</p>
         )}
       </Section>
 
@@ -365,6 +390,7 @@ export default function PropertiesPanel() {
       <Section title={`Keyframe${selKf.length > 1 ? ` (${selKf.length})` : ''}`}>
         {kf && seq ? (
           <div className="flex flex-col gap-2">
+
             <Field label="Frame">
               <NumInput
                 value={kf.frame}
@@ -385,20 +411,23 @@ export default function PropertiesPanel() {
             </Field>
             <Field label={`Time (${(kf.frame / fps).toFixed(3)}s)`} />
             <Field label="Interpolation">
-              <select
-                value={kf.interpolation}
-                onChange={(e) =>
-                  updateKeyframe(seq.id, kf.frame, {
-                    interpolation: e.target.value as Interpolation,
-                  })
-                }
-                className="w-full bg-[#2a2a2a] border border-[#3d3d3d] rounded px-1 py-0.5 text-xs text-[#e0e0e0] outline-none"
-              >
-                <option value="step">Step (Hold)</option>
-                <option value="linear">Linear</option>
-                <option value="smooth">Smooth</option>
-                <option value="bezier">Bezier (Custom)</option>
-              </select>
+              <div className="relative">
+                <select
+                  value={kf.interpolation}
+                  onChange={(e) =>
+                    updateKeyframe(seq.id, kf.frame, {
+                      interpolation: e.target.value as Interpolation,
+                    })
+                  }
+                  className="w-full appearance-none bg-[#2a2a2a] border border-[#3d3d3d] rounded px-2 py-1 text-xs text-[#e0e0e0] cursor-pointer outline-none focus:border-[#555] pr-6"
+                >
+                  <option value="step">Step (Hold)</option>
+                  <option value="linear">Linear</option>
+                  <option value="smooth">Smooth</option>
+                  <option value="bezier">Bezier (Custom)</option>
+                </select>
+                <SelectArrow />
+              </div>
             </Field>
 
             {/* Bezier editor */}
@@ -421,13 +450,14 @@ export default function PropertiesPanel() {
               onClick={() => { removeKeyframe(seq.id, kf.frame); }}
               className="text-xs text-[#ef4444] hover:text-[#f87171] py-1 border border-[#3d3d3d] rounded hover:border-[#ef4444] transition-colors"
             >
-              Delete Keyframe
+              {t('deleteKeyframe')}
             </button>
           </div>
         ) : selKf.length > 1 && seq ? (
           <div className="flex flex-col gap-2">
-            <p className="text-[#888] text-xs">{selKf.length}個選択中</p>
-            <Field label="Interpolation (全)">
+            <p className="text-[#888] text-xs">{translations[language].selectedCount(selKf.length)}</p>
+            <Field label={t('interpAll')}>
+              <div className="relative">
               <select
                 defaultValue=""
                 onChange={(e) => {
@@ -438,71 +468,29 @@ export default function PropertiesPanel() {
                     })
                   );
                 }}
-                className="w-full bg-[#2a2a2a] border border-[#3d3d3d] rounded px-1 py-0.5 text-xs text-[#e0e0e0] outline-none"
+                className="w-full appearance-none bg-[#2a2a2a] border border-[#3d3d3d] rounded px-2 py-1 text-xs text-[#e0e0e0] cursor-pointer outline-none focus:border-[#555] pr-6"
               >
-                <option value="" disabled>変更...</option>
+                <option value="" disabled>{t('changeInterp')}</option>
                 <option value="step">Step (Hold)</option>
                 <option value="linear">Linear</option>
                 <option value="smooth">Smooth</option>
                 <option value="bezier">Bezier (Custom)</option>
               </select>
+              <SelectArrow />
+              </div>
             </Field>
             <button
               onClick={() => selKf.forEach((k) => removeKeyframe(seq.id, k.frame))}
               className="text-xs text-[#ef4444] hover:text-[#f87171] py-1 border border-[#3d3d3d] rounded hover:border-[#ef4444] transition-colors"
             >
-              Delete All Selected
+              {t('deleteAllSelected')}
             </button>
           </div>
         ) : (
-          <p className="text-[#555] text-xs">ダブルクリックで追加</p>
+          <p className="text-[#555] text-xs">{t('dblClickToAdd')}</p>
         )}
       </Section>
 
-      {/* OSC Config */}
-      <Section title="OSC">
-        <div className="flex flex-col gap-2">
-          <div className="flex items-center gap-2">
-            <input
-              type="checkbox"
-              id="osc-enabled"
-              checked={oscConfig.enabled}
-              onChange={(e) =>
-                updateProject({ oscConfig: { ...oscConfig, enabled: e.target.checked } })
-              }
-              className="accent-[#4ade80]"
-            />
-            <label htmlFor="osc-enabled" className="text-xs cursor-pointer">
-              Enable OSC
-            </label>
-            <span
-              className={`ml-auto w-2 h-2 rounded-full ${oscConfig.enabled ? 'bg-[#4ade80]' : 'bg-[#555]'}`}
-            />
-          </div>
-          <Field label="IP">
-            <input
-              type="text"
-              value={oscConfig.ip}
-              onChange={(e) =>
-                updateProject({ oscConfig: { ...oscConfig, ip: e.target.value } })
-              }
-              onKeyDown={(e) => e.stopPropagation()}
-              className="w-full font-mono text-xs"
-            />
-          </Field>
-          <Field label="Port">
-            <NumInput
-              value={oscConfig.port}
-              min={1}
-              max={65535}
-              step={1}
-              onCommit={(v) =>
-                updateProject({ oscConfig: { ...oscConfig, port: Math.round(v) } })
-              }
-            />
-          </Field>
-        </div>
-      </Section>
     </div>
   );
 }
@@ -523,6 +511,17 @@ function Field({ label, children }: { label: string; children?: React.ReactNode 
     <div className="flex flex-col gap-0.5">
       <label className="text-[10px] text-[#666] uppercase tracking-wide">{label}</label>
       {children}
+    </div>
+  );
+}
+
+
+function SelectArrow() {
+  return (
+    <div className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[#555]">
+      <svg width="8" height="8" viewBox="0 0 8 8" fill="currentColor">
+        <path d="M4 6L0 2h8z" />
+      </svg>
     </div>
   );
 }

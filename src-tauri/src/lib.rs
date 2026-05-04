@@ -1,9 +1,13 @@
+mod dmx;
 mod engine;
 mod interpolation;
 mod osc;
+mod serial;
 mod types;
 
+use dmx::DmxState;
 use engine::EngineState;
+use serial::SerialState;
 use tauri::State;
 use types::Project;
 
@@ -12,13 +16,20 @@ use types::Project;
 #[tauri::command]
 fn start_playback(
     state: State<'_, EngineState>,
+    serial_state: State<'_, SerialState>,
+    dmx_state: State<'_, DmxState>,
     app: tauri::AppHandle,
     project_json: String,
     start_frame: i64,
+    loop_enabled: bool,
+    loop_in: i64,
+    loop_out: i64,
 ) -> Result<(), String> {
     let project: Project =
         serde_json::from_str(&project_json).map_err(|e| e.to_string())?;
-    engine::start(&state, app, project, start_frame);
+    let serial_port = std::sync::Arc::clone(&serial_state.port);
+    let dmx_port = std::sync::Arc::clone(&dmx_state.port);
+    engine::start(&state, app, project, start_frame, loop_enabled, loop_in, loop_out, serial_port, dmx_port);
     Ok(())
 }
 
@@ -50,7 +61,6 @@ fn export_csv(path: String, project_json: String) -> Result<(), String> {
 
     let mut out = String::new();
 
-    // Header
     out.push_str("frame");
     for seq in &project.sequences {
         out.push(',');
@@ -58,7 +68,6 @@ fn export_csv(path: String, project_json: String) -> Result<(), String> {
     }
     out.push('\n');
 
-    // Rows
     for frame in 0..=project.duration_frames {
         out.push_str(&frame.to_string());
         for seq in &project.sequences {
@@ -82,6 +91,8 @@ fn export_csv(path: String, project_json: String) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .manage(EngineState::new())
+        .manage(SerialState::new())
+        .manage(DmxState::new())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
@@ -91,6 +102,11 @@ pub fn run() {
             load_project,
             save_project,
             export_csv,
+            serial::list_serial_ports,
+            serial::open_serial_port,
+            serial::close_serial_port,
+            dmx::open_dmx_port,
+            dmx::close_dmx_port,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

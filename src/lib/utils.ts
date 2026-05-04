@@ -20,3 +20,7 @@ export function formatTime(frame: number, fps: number): string {
 export function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
+
+export function nameToOscAddress(name: string): string {
+  return '/' + name.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_/]/g, '');
+}

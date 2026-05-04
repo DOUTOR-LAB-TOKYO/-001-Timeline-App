@@ -1,8 +1,11 @@
-import { useRef, useEffect, useState, useCallback } from 'react';
+import { useRef, useEffect, useState, useCallback, useMemo } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../../store';
 import { interpolateValue } from '../../lib/interpolation';
 import { clamp } from '../../lib/utils';
-import { RULER_H, ROW_H } from '../../lib/constants';
+import { RULER_H, WAVEFORM_H, ROW_H } from '../../lib/constants';
+import { useT } from '../../lib/i18n';
+import { playAudio } from '../../lib/audio';
 import type { Interpolation, Sequence, Keyframe } from '../../types';
 
 // ─── Constants ───────────────────────────────────────────────────────
@@ -11,32 +14,44 @@ const KF_HALF = 5;
 const VALUE_PAD = 10;
 const SNAP_PX = 10;
 const BZ_R = 4;
+const LEFT_PAD = 8; // px buffer so frame 0 isn't flush with the left edge
 
 // ─── Coordinate helpers ──────────────────────────────────────────────
 
 function frameToX(frame: number, viewStart: number, zoom: number): number {
-  return (frame - viewStart) / zoom;
+  return LEFT_PAD + (frame - viewStart) / zoom;
 }
 
 function xToFrame(x: number, viewStart: number, zoom: number): number {
-  return viewStart + x * zoom;
+  return viewStart + (x - LEFT_PAD) * zoom;
 }
 
-function valueToY(value: number, rowTop: number, seq: Sequence): number {
+function valueToY(value: number, rowTop: number, seq: Sequence, rowH: number): number {
   const range = seq.max - seq.min || 1;
   const t = (value - seq.min) / range;
-  const usableH = ROW_H - 2 * VALUE_PAD;
-  return rowTop + ROW_H - VALUE_PAD - t * usableH;
+  const usableH = rowH - 2 * VALUE_PAD;
+  return rowTop + rowH - VALUE_PAD - t * usableH;
 }
 
-function yToValue(y: number, rowTop: number, seq: Sequence): number {
-  const usableH = ROW_H - 2 * VALUE_PAD;
-  const t = (rowTop + ROW_H - VALUE_PAD - y) / usableH;
+function yToValue(y: number, rowTop: number, seq: Sequence, rowH: number): number {
+  const usableH = rowH - 2 * VALUE_PAD;
+  const t = (rowTop + rowH - VALUE_PAD - y) / usableH;
   return clamp(seq.min + t * (seq.max - seq.min), seq.min, seq.max);
 }
 
-function getRowTop(seqIndex: number, vertScroll: number): number {
-  return RULER_H + seqIndex * ROW_H - vertScroll;
+function getRowTop(seqIndex: number, vertScroll: number, rowHArr: number[], contentTop: number): number {
+  let top = contentTop - vertScroll;
+  for (let i = 0; i < seqIndex; i++) top += rowHArr[i];
+  return top;
+}
+
+function getRowIndexAt(y: number, vertScroll: number, rowHArr: number[], contentTop: number): number {
+  let top = contentTop - vertScroll;
+  for (let i = 0; i < rowHArr.length; i++) {
+    if (y < top + rowHArr[i]) return i;
+    top += rowHArr[i];
+  }
+  return rowHArr.length - 1;
 }
 
 // ─── Bezier handle helpers ────────────────────────────────────────────
@@ -48,13 +63,13 @@ interface BzHandlePos {
 
 function getBzHandles(
   kf: Keyframe, nextKf: Keyframe,
-  rowTop: number, seq: Sequence,
+  rowTop: number, seq: Sequence, rowH: number,
   vStart: number, z: number
 ): BzHandlePos {
   const kx = frameToX(kf.frame, vStart, z);
-  const ky = valueToY(kf.value, rowTop, seq);
+  const ky = valueToY(kf.value, rowTop, seq, rowH);
   const nkx = frameToX(nextKf.frame, vStart, z);
-  const nky = valueToY(nextKf.value, rowTop, seq);
+  const nky = valueToY(nextKf.value, rowTop, seq, rowH);
   const cp1x = kf.cp1x ?? 0.25;
   const cp1y = kf.cp1y ?? 0.25;
   const cp2x = kf.cp2x ?? 0.75;
@@ -68,6 +83,28 @@ function getBzHandles(
   };
 }
 
+// ─── Value grid helpers ──────────────────────────────────────────────
+
+function getValueGridInterval(min: number, max: number): number {
+  const range = max - min;
+  if (range === 0) return 1;
+  const rough = range / 4;
+  const mag = Math.pow(10, Math.floor(Math.log10(rough)));
+  const norm = rough / mag;
+  let nice: number;
+  if (norm < 1.5) nice = 1;
+  else if (norm < 3.5) nice = 2;
+  else if (norm < 7.5) nice = 5;
+  else nice = 10;
+  return nice * mag;
+}
+
+function formatGridLabel(v: number, interval: number): string {
+  if (interval >= 1) return String(Math.round(v));
+  const decimals = Math.max(0, -Math.floor(Math.log10(interval)));
+  return v.toFixed(decimals);
+}
+
 // ─── Snap helper ─────────────────────────────────────────────────────
 
 function getSnappedFrame(
@@ -75,16 +112,15 @@ function getSnappedFrame(
   sequences: Sequence[],
   zoom: number,
   options: {
-    excludeSeqId?: string;       // skip ALL kfs in this sequence (prevents same-seq overwrite)
-    excludeFrames?: Set<number>; // skip these frames globally
-    gridSize?: number;           // also snap to multiples of this (0 = off)
+    excludeSeqId?: string;
+    excludeFrames?: Set<number>;
+    gridSize?: number;
   } = {}
 ): { frame: number; snapped: boolean } {
   const threshold = SNAP_PX * zoom;
   let best = rawFrame;
   let bestDist = threshold;
 
-  // Snap to other keyframes
   for (const seq of sequences) {
     if (seq.id === options.excludeSeqId) continue;
     for (const kf of seq.keyframes) {
@@ -94,7 +130,6 @@ function getSnappedFrame(
     }
   }
 
-  // Snap to frame grid
   if (options.gridSize && options.gridSize > 0) {
     const gridFrame = Math.round(rawFrame / options.gridSize) * options.gridSize;
     const dist = Math.abs(gridFrame - rawFrame);
@@ -130,15 +165,17 @@ interface KfHit { seqId: string; seqIndex: number; frame: number; value: number;
 function hitTestKeyframe(
   x: number, y: number,
   sequences: Sequence[],
-  viewStart: number, zoom: number, vertScroll: number
+  viewStart: number, zoom: number, vertScroll: number,
+  rowHArr: number[], contentTop: number
 ): KfHit | null {
   const hitR = KF_HALF + 6;
   for (let i = 0; i < sequences.length; i++) {
     const seq = sequences[i];
-    const rowTop = getRowTop(i, vertScroll);
+    const rowH = rowHArr[i];
+    const rowTop = getRowTop(i, vertScroll, rowHArr, contentTop);
     for (const kf of seq.keyframes) {
       const kx = frameToX(kf.frame, viewStart, zoom);
-      const ky = valueToY(kf.value, rowTop, seq);
+      const ky = valueToY(kf.value, rowTop, seq, rowH);
       if ((x - kx) ** 2 + (y - ky) ** 2 <= hitR ** 2) {
         return { seqId: seq.id, seqIndex: i, frame: kf.frame, value: kf.value };
       }
@@ -157,19 +194,21 @@ function hitTestBzHandle(
   x: number, y: number,
   sequences: Sequence[],
   vStart: number, zoom: number, vertScroll: number,
-  selectedKeyframes: Map<string, Set<number>>
+  selectedKeyframes: Map<string, Set<number>>,
+  rowHArr: number[], contentTop: number
 ): BzHit | null {
   const hitR = BZ_R + 5;
   for (let i = 0; i < sequences.length; i++) {
     const seq = sequences[i];
-    const rowTop = getRowTop(i, vertScroll);
+    const rowH = rowHArr[i];
+    const rowTop = getRowTop(i, vertScroll, rowHArr, contentTop);
     const sorted = [...seq.keyframes].sort((a, b) => a.frame - b.frame);
     for (let j = 0; j < sorted.length - 1; j++) {
       const kf = sorted[j];
       if (kf.interpolation !== 'bezier') continue;
       if (!(selectedKeyframes.get(seq.id)?.has(kf.frame) ?? false)) continue;
       const nextKf = sorted[j + 1];
-      const { h1x, h1y, h2x, h2y } = getBzHandles(kf, nextKf, rowTop, seq, vStart, zoom);
+      const { h1x, h1y, h2x, h2y } = getBzHandles(kf, nextKf, rowTop, seq, rowH, vStart, zoom);
       if ((x - h1x) ** 2 + (y - h1y) ** 2 <= hitR ** 2) {
         return { seqId: seq.id, seqIndex: i, frame: kf.frame, nextFrame: nextKf.frame, handle: 'cp1' };
       }
@@ -190,16 +229,12 @@ interface MultiInitPos { seqId: string; frame: number; value: number; }
 interface DragState {
   type: DragType;
   startX: number; startY: number; startViewStart: number;
-  // kf drag
   kfSeqId?: string; kfSeqIndex?: number; kfCurFrame?: number;
   snapLocked?: number; snapTargetFrame?: number;
-  // multi-drag
   kfMultiInitPositions?: MultiInitPos[];
   kfAnchorInitFrame?: number;
   kfPrevDelta?: number;
-  // bezier handle drag
   bzSeqId?: string; bzFrame?: number; bzHandle?: 'cp1' | 'cp2'; bzNextFrame?: number;
-  // marquee
   curX?: number; curY?: number;
 }
 
@@ -226,7 +261,7 @@ export default function TimelineCanvas() {
   const [vertScroll, setVertScroll] = useState(0);
   const [cursor, setCursor] = useState<string>('crosshair');
   const [contextMenu, setContextMenu] = useState<{
-    x: number; y: number; seqId: string; frame: number; interp: Interpolation;
+    x: number; y: number; seqId: string; frame: number; interp: Interpolation; isMulti: boolean;
   } | null>(null);
 
   const project = useAppStore((s) => s.project);
@@ -236,6 +271,7 @@ export default function TimelineCanvas() {
   const viewStartFrame = useAppStore((s) => s.viewStartFrame);
   const zoom = useAppStore((s) => s.zoom);
   const selectedKeyframes = useAppStore((s) => s.selectedKeyframes);
+  const rowHeights = useAppStore((s) => s.rowHeights);
   const setCurrentFrame = useAppStore((s) => s.setCurrentFrame);
   const setViewStartFrame = useAppStore((s) => s.setViewStartFrame);
   const setZoom = useAppStore((s) => s.setZoom);
@@ -249,8 +285,39 @@ export default function TimelineCanvas() {
   const updateKeyframe = useAppStore((s) => s.updateKeyframe);
   const snapGridSize = useAppStore((s) => s.snapGridSize);
   const setSnapGridSize = useAppStore((s) => s.setSnapGridSize);
+  const waveformSamples = useAppStore((s) => s.waveformSamples);
+
+  const contentTop = waveformSamples ? RULER_H + WAVEFORM_H : RULER_H;
+  const tl = useT();
+
+  // Per-row height array (index matches sequences array)
+  const rowHArr = useMemo(
+    () => sequences.map((s) => rowHeights.get(s.id) ?? ROW_H),
+    [sequences, rowHeights]
+  );
 
   const drag = useRef<DragState>({ type: 'idle', startX: 0, startY: 0, startViewStart: 0 });
+  const lastTapRef = useRef<{ time: number; x: number; y: number } | null>(null);
+  const seekDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const seekTo = useCallback((frame: number) => {
+    setCurrentFrame(frame);
+    const { isPlaying, getPlaybackJSON, loopEnabled, loopIn, loopOut, project } = useAppStore.getState();
+    if (!isPlaying) return;
+    // デバウンスしてドラッグ中の連続 invoke を抑制
+    if (seekDebounceRef.current) clearTimeout(seekDebounceRef.current);
+    seekDebounceRef.current = setTimeout(async () => {
+      await invoke('stop_playback').catch(() => {});
+      playAudio(frame / project.fps);
+      await invoke('start_playback', {
+        projectJson: getPlaybackJSON(),
+        startFrame: frame,
+        loopEnabled,
+        loopIn,
+        loopOut,
+      }).catch(console.error);
+    }, 80);
+  }, [setCurrentFrame]);
 
   // ─── Resize ──────────────────────────────────────────────────────
 
@@ -292,11 +359,79 @@ export default function TimelineCanvas() {
     ctx.fillStyle = '#181818';
     ctx.fillRect(0, 0, W, H);
 
+    // ── Waveform strip ──────────────────────────────────────────
+    if (waveformSamples && waveformSamples.length > 0) {
+      const wTop = RULER_H;
+      const wH = WAVEFORM_H;
+      const midY = wTop + wH / 2;
+      const ampH = (wH / 2) * 0.85;
+
+      ctx.fillStyle = '#1c1c1c';
+      ctx.fillRect(0, wTop, W, wH);
+
+      // Total pixel width of the audio (from frame 0 to durationFrames)
+      const totalPx = durationFrames / z;
+      const startX = frameToX(0, vStart, z);
+      const endX = frameToX(durationFrames, vStart, z);
+
+      if (endX > 0 && startX < W) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(Math.max(0, startX), wTop, Math.min(W, endX) - Math.max(0, startX), wH);
+        ctx.clip();
+
+        const numSamples = waveformSamples.length;
+        // Map each canvas pixel x to a sample index
+        ctx.fillStyle = '#3a7a5a';
+        ctx.beginPath();
+        let firstPoint = true;
+        // Draw top half (positive)
+        for (let px = Math.max(0, Math.floor(startX)); px <= Math.min(W, Math.ceil(endX)); px++) {
+          const t = (px - startX) / (totalPx > 0 ? totalPx : 1);
+          const sIdx = Math.min(numSamples - 1, Math.floor(t * numSamples));
+          const amp = waveformSamples[sIdx] * ampH;
+          if (firstPoint) { ctx.moveTo(px, midY - amp); firstPoint = false; }
+          else ctx.lineTo(px, midY - amp);
+        }
+        // Draw bottom half (mirrored)
+        for (let px = Math.min(W, Math.ceil(endX)); px >= Math.max(0, Math.floor(startX)); px--) {
+          const t = (px - startX) / (totalPx > 0 ? totalPx : 1);
+          const sIdx = Math.min(numSamples - 1, Math.floor(t * numSamples));
+          const amp = waveformSamples[sIdx] * ampH;
+          ctx.lineTo(px, midY + amp);
+        }
+        ctx.closePath();
+        ctx.fill();
+
+        // Bright outline on top edge
+        ctx.strokeStyle = '#4ade80';
+        ctx.lineWidth = 1;
+        ctx.globalAlpha = 0.5;
+        ctx.beginPath();
+        firstPoint = true;
+        for (let px = Math.max(0, Math.floor(startX)); px <= Math.min(W, Math.ceil(endX)); px++) {
+          const t = (px - startX) / (totalPx > 0 ? totalPx : 1);
+          const sIdx = Math.min(numSamples - 1, Math.floor(t * numSamples));
+          const amp = waveformSamples[sIdx] * ampH;
+          if (firstPoint) { ctx.moveTo(px, midY - amp); firstPoint = false; }
+          else ctx.lineTo(px, midY - amp);
+        }
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+        ctx.restore();
+      }
+
+      // Bottom border
+      ctx.fillStyle = '#2a2a2a';
+      ctx.fillRect(0, wTop + wH - 1, W, 1);
+    }
+
     // ── Sequence rows ───────────────────────────────────────────
     for (let i = 0; i < sequences.length; i++) {
       const seq = sequences[i];
-      const rowTop = getRowTop(i, vertScroll);
-      const rowBot = rowTop + ROW_H;
+      const rowH = rowHArr[i];
+      const rowTop = getRowTop(i, vertScroll, rowHArr, contentTop);
+      const rowBot = rowTop + rowH;
       if (rowBot <= RULER_H || rowTop >= H) continue;
 
       const clipTop = Math.max(RULER_H, rowTop);
@@ -307,13 +442,29 @@ export default function TimelineCanvas() {
       ctx.fillStyle = '#282828';
       ctx.fillRect(0, rowBot - 1, W, 1);
 
-      if (seq.min <= 0 && seq.max >= 0) {
-        const zeroY = valueToY(0, rowTop, seq);
-        if (zeroY > clipTop && zeroY < clipBot) {
-          ctx.setLineDash([3, 4]); ctx.strokeStyle = '#2e2e2e'; ctx.lineWidth = 1;
-          ctx.beginPath(); ctx.moveTo(0, zeroY); ctx.lineTo(W, zeroY); ctx.stroke();
+      // Value grid lines + labels
+      {
+        const valInterval = getValueGridInterval(seq.min, seq.max);
+        const firstMult = Math.ceil((seq.min + valInterval * 0.01) / valInterval);
+        const lastMult  = Math.floor((seq.max - valInterval * 0.01) / valInterval);
+        ctx.save();
+        ctx.beginPath(); ctx.rect(0, clipTop, W, clipBot - clipTop); ctx.clip();
+        ctx.font = `9px ui-monospace, 'SF Mono', Menlo, monospace`;
+        ctx.textBaseline = 'middle';
+        ctx.textAlign = 'left';
+        for (let m = firstMult; m <= lastMult; m++) {
+          const v = m * valInterval;
+          const gy = Math.round(valueToY(v, rowTop, seq, rowH)) + 0.5;
+          const isZero = v === 0;
+          ctx.setLineDash(isZero ? [3, 4] : []);
+          ctx.strokeStyle = isZero ? '#2e2e2e' : '#232323';
+          ctx.lineWidth = 1;
+          ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(W, gy); ctx.stroke();
           ctx.setLineDash([]);
+          ctx.fillStyle = isZero ? '#3a3a3a' : '#2c2c2c';
+          ctx.fillText(formatGridLabel(v, valInterval), 4, gy - 5);
         }
+        ctx.restore();
       }
 
       if (!seq.enabled || seq.muted) continue;
@@ -335,7 +486,7 @@ export default function TimelineCanvas() {
         const f = xToFrame(px, vStart, z);
         if (f < firstKf.frame || f > lastKf.frame) continue;
         const val = interpolateValue(sorted, f);
-        const cy = valueToY(val, rowTop, seq);
+        const cy = valueToY(val, rowTop, seq, rowH);
         if (!started) { ctx.moveTo(px, cy); started = true; } else ctx.lineTo(px, cy);
       }
       ctx.stroke();
@@ -351,12 +502,11 @@ export default function TimelineCanvas() {
         if (!isKfSelected && !isBzDragging) continue;
 
         const nextKf = sorted[j + 1];
-        const { kx, ky, nkx, nky, h1x, h1y, h2x, h2y } = getBzHandles(kf, nextKf, rowTop, seq, vStart, z);
+        const { kx, ky, nkx, nky, h1x, h1y, h2x, h2y } = getBzHandles(kf, nextKf, rowTop, seq, rowH, vStart, z);
 
         ctx.save();
         ctx.beginPath(); ctx.rect(0, clipTop - BZ_R * 2, W, clipBot - clipTop + BZ_R * 4); ctx.clip();
 
-        // Lines from anchors to handles
         ctx.strokeStyle = 'rgba(255,255,255,0.25)';
         ctx.lineWidth = 1;
         ctx.setLineDash([2, 3]);
@@ -366,7 +516,6 @@ export default function TimelineCanvas() {
         ctx.stroke();
         ctx.setLineDash([]);
 
-        // Handle circles
         ctx.lineWidth = 1.5;
         ctx.strokeStyle = '#fff';
         ctx.fillStyle = '#60a5fa';
@@ -379,7 +528,7 @@ export default function TimelineCanvas() {
       for (const kf of sorted) {
         const kx = frameToX(kf.frame, vStart, z);
         if (kx < -KF_HALF - 1 || kx > W + KF_HALF + 1) continue;
-        const ky = clamp(valueToY(kf.value, rowTop, seq), clipTop + KF_HALF, clipBot - KF_HALF);
+        const ky = clamp(valueToY(kf.value, rowTop, seq, rowH), clipTop + KF_HALF, clipBot - KF_HALF);
         const isSelected = selectedKeyframes.get(seq.id)?.has(kf.frame) ?? false;
 
         ctx.save();
@@ -404,13 +553,13 @@ export default function TimelineCanvas() {
     const firstMajor = Math.ceil(vStart / major) * major;
     for (let f = firstMajor; frameToX(f, vStart, z) <= W; f += major) {
       const x = frameToX(f, vStart, z);
-      ctx.beginPath(); ctx.moveTo(x + 0.5, RULER_H); ctx.lineTo(x + 0.5, H); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x + 0.5, contentTop); ctx.lineTo(x + 0.5, H); ctx.stroke();
     }
 
     const durX = Math.round(frameToX(durationFrames, vStart, z));
     if (durX >= 0 && durX <= W) {
       ctx.strokeStyle = '#505050'; ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
-      ctx.beginPath(); ctx.moveTo(durX + 0.5, RULER_H); ctx.lineTo(durX + 0.5, H); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(durX + 0.5, contentTop); ctx.lineTo(durX + 0.5, H); ctx.stroke();
       ctx.setLineDash([]);
     }
 
@@ -450,12 +599,12 @@ export default function TimelineCanvas() {
       ctx.save();
       ctx.strokeStyle = '#4ade80'; ctx.lineWidth = 1;
       ctx.setLineDash([4, 3]); ctx.globalAlpha = 0.8;
-      ctx.beginPath(); ctx.moveTo(snapX + 0.5, RULER_H); ctx.lineTo(snapX + 0.5, H); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(snapX + 0.5, contentTop); ctx.lineTo(snapX + 0.5, H); ctx.stroke();
       ctx.setLineDash([]);
       ctx.fillStyle = '#4ade80'; ctx.globalAlpha = 1;
       ctx.beginPath();
-      ctx.moveTo(snapX, RULER_H); ctx.lineTo(snapX + 5, RULER_H + 8);
-      ctx.lineTo(snapX, RULER_H + 16); ctx.lineTo(snapX - 5, RULER_H + 8);
+      ctx.moveTo(snapX, contentTop); ctx.lineTo(snapX + 5, contentTop + 8);
+      ctx.lineTo(snapX, contentTop + 16); ctx.lineTo(snapX - 5, contentTop + 8);
       ctx.closePath(); ctx.fill();
       ctx.restore();
     }
@@ -468,10 +617,18 @@ export default function TimelineCanvas() {
       ctx.strokeStyle = 'rgba(59,130,246,0.55)'; ctx.lineWidth = 1;
       ctx.strokeRect(rx + 0.5, ry + 0.5, rw, rh);
     }
-  }, [size, sequences, fps, durationFrames, currentFrame, viewStartFrame, zoom, selectedKeyframes, vertScroll]);
+  }, [size, sequences, fps, durationFrames, currentFrame, viewStartFrame, zoom, selectedKeyframes, vertScroll, rowHArr, waveformSamples, contentTop]);
 
   useEffect(() => { drawRef.current = draw; }, [draw]);
   useEffect(() => { if (!isPlaying) draw(); }, [draw, isPlaying]);
+
+  // durationFrames 変更時 or 初回サイズ確定時にビュー全体をフィット
+  useEffect(() => {
+    if (size.w === 0 || durationFrames === 0) return;
+    const usableW = size.w - LEFT_PAD * 2;
+    setZoom(durationFrames / usableW);
+    setViewStartFrame(0);
+  }, [durationFrames, size.w]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!isPlaying) return;
@@ -510,18 +667,20 @@ export default function TimelineCanvas() {
       const { x, y } = getXY(e);
       const vStart = viewStartFrame, z = zoom;
 
-      // Ruler seek
-      if (y < RULER_H) {
+      // Ruler seek (ruler area + waveform strip)
+      if (y < contentTop) {
+        lastTapRef.current = null;
         const frame = clamp(Math.round(xToFrame(x, vStart, z)), 0, durationFrames);
-        setCurrentFrame(frame);
+        seekTo(frame);
         drag.current = { type: 'seek', startX: x, startY: y, startViewStart: vStart };
         setCursor('col-resize');
         return;
       }
 
-      // Hit test bezier handles first (only if kf is selected)
-      const bzHit = hitTestBzHandle(x, y, sequences, vStart, z, vertScroll, useAppStore.getState().selectedKeyframes);
+      // Hit test bezier handles first
+      const bzHit = hitTestBzHandle(x, y, sequences, vStart, z, vertScroll, useAppStore.getState().selectedKeyframes, rowHArr, contentTop);
       if (bzHit) {
+        lastTapRef.current = null;
         drag.current = {
           type: 'bz', startX: x, startY: y, startViewStart: vStart,
           bzSeqId: bzHit.seqId, bzFrame: bzHit.frame,
@@ -532,15 +691,15 @@ export default function TimelineCanvas() {
       }
 
       // Hit test keyframes
-      const hit = hitTestKeyframe(x, y, sequences, vStart, z, vertScroll);
+      const hit = hitTestKeyframe(x, y, sequences, vStart, z, vertScroll, rowHArr, contentTop);
       if (hit) {
+        lastTapRef.current = null;
         const currentSel = useAppStore.getState().selectedKeyframes;
         const clickedIsSelected = currentSel.get(hit.seqId)?.has(hit.frame) ?? false;
         const totalSelected = [...currentSel.values()].reduce((s, set) => s + set.size, 0);
         const isMultiDrag = clickedIsSelected && totalSelected > 1 && !e.shiftKey && !e.metaKey && !e.ctrlKey;
 
         if (isMultiDrag) {
-          // Multi-drag: collect all selected kf positions
           const freshSeqs = useAppStore.getState().project.sequences;
           const positions: MultiInitPos[] = [];
           const excludeFrames = new Set<number>();
@@ -570,8 +729,32 @@ export default function TimelineCanvas() {
         return;
       }
 
+      // Double-click detection (replaces onDoubleClick which is unreliable on trackpad)
+      const now = Date.now();
+      const last = lastTapRef.current;
+      const isDoubleTap = last != null &&
+        (now - last.time) < 350 &&
+        Math.hypot(x - last.x, y - last.y) < 8;
+      lastTapRef.current = { time: now, x, y };
+
+      if (isDoubleTap) {
+        lastTapRef.current = null;
+        const rowIndex = getRowIndexAt(y, vertScroll, rowHArr, contentTop);
+        if (rowIndex >= 0 && rowIndex < sequences.length) {
+          const seq = sequences[rowIndex];
+          if (!seq.locked) {
+            const frame = clamp(Math.round(xToFrame(x, vStart, z)), 0, durationFrames);
+            const rowTop = getRowTop(rowIndex, vertScroll, rowHArr, contentTop);
+            const value = clamp(yToValue(y, rowTop, seq, rowHArr[rowIndex]), seq.min, seq.max);
+            addKeyframe(seq.id, { frame, value, interpolation: 'linear' });
+            setSelectedSequence(seq.id);
+          }
+        }
+        return;
+      }
+
       // Row selection
-      const rowIndex = Math.floor((y - RULER_H + vertScroll) / ROW_H);
+      const rowIndex = getRowIndexAt(y, vertScroll, rowHArr, contentTop);
       if (rowIndex >= 0 && rowIndex < sequences.length) {
         setSelectedSequence(sequences[rowIndex].id);
       }
@@ -586,8 +769,8 @@ export default function TimelineCanvas() {
       drag.current = { type: 'marquee', startX: x, startY: y, startViewStart: vStart, curX: x, curY: y };
       setCursor('crosshair');
     },
-    [sequences, viewStartFrame, zoom, vertScroll, durationFrames,
-     setCurrentFrame, setSelectedSequence, toggleKeyframeSelection, clearKeyframeSelection]
+    [sequences, viewStartFrame, zoom, vertScroll, durationFrames, rowHArr,
+     setCurrentFrame, setSelectedSequence, toggleKeyframeSelection, clearKeyframeSelection, addKeyframe, contentTop]
   );
 
   // ─── Mouse move ──────────────────────────────────────────────────
@@ -600,7 +783,7 @@ export default function TimelineCanvas() {
       const z = zoom;
 
       if (d.type === 'seek') {
-        setCurrentFrame(clamp(Math.round(xToFrame(x, viewStartFrame, z)), 0, durationFrames));
+        seekTo(clamp(Math.round(xToFrame(x, d.startViewStart, z)), 0, durationFrames));
         return;
       }
 
@@ -615,8 +798,9 @@ export default function TimelineCanvas() {
 
         const frameSpan = nextKf.frame - kf.frame;
         const valueSpan = nextKf.value - kf.value;
-        const mouseFrame = xToFrame(x, viewStartFrame, z);
-        const mouseValue = yToValue(y, getRowTop(seqIdx, vertScroll), seq);
+        const mouseFrame = xToFrame(x, d.startViewStart, z);
+        const rowTop = getRowTop(seqIdx, vertScroll, rowHArr, contentTop);
+        const mouseValue = yToValue(y, rowTop, seq, rowHArr[seqIdx]);
 
         const normX = frameSpan > 0 ? clamp((mouseFrame - kf.frame) / frameSpan, 0, 1) : 0;
         const normY = Math.abs(valueSpan) > 1e-10 ? (mouseValue - kf.value) / valueSpan : 0;
@@ -635,16 +819,15 @@ export default function TimelineCanvas() {
         const seq = freshSeqs.find((s) => s.id === d.kfSeqId);
         if (!seq || seq.locked) return;
 
-        const rawFrame = clamp(Math.round(xToFrame(x, viewStartFrame, z)), 0, durationFrames);
+        // Use startViewStart so frame position stays stable even if view shifts mid-drag
+        const continuousFrame = clamp(xToFrame(x, d.startViewStart, z), 0, durationFrames);
+        const rawFrame = Math.round(continuousFrame);
 
-        // Sticky snap
         let finalFrame: number;
         let isSnapped: boolean;
 
         const gridSize = useAppStore.getState().snapGridSize;
 
-        // Single-kf: exclude same-seq kfs from snap (prevents accidental overwrite)
-        // Multi-drag: exclude the currently dragged frames globally
         const snapOpts = d.kfMultiInitPositions
           ? {
               excludeFrames: new Set(d.kfMultiInitPositions.map((p) => p.frame + (d.kfPrevDelta ?? 0))),
@@ -653,7 +836,8 @@ export default function TimelineCanvas() {
           : { excludeSeqId: d.kfSeqId, gridSize };
 
         if (d.snapLocked !== undefined) {
-          const pixelDist = Math.abs(rawFrame - d.snapLocked) / z;
+          // Use continuous (unrounded) frame for pixel distance so snap releases at exactly SNAP_PX
+          const pixelDist = Math.abs(continuousFrame - d.snapLocked) / z;
           if (pixelDist <= SNAP_PX) {
             finalFrame = d.snapLocked; isSnapped = true;
           } else {
@@ -666,7 +850,6 @@ export default function TimelineCanvas() {
         }
 
         if (d.kfMultiInitPositions) {
-          // Multi-drag: move all selected kfs by same frame delta
           const frameDelta = finalFrame - d.kfAnchorInitFrame!;
           if (frameDelta !== d.kfPrevDelta) {
             const prevDelta = d.kfPrevDelta ?? 0;
@@ -686,8 +869,6 @@ export default function TimelineCanvas() {
             };
           }
         } else {
-          // Single kf drag
-          // Collision guard: don't move onto a frame already occupied by another kf
           const wouldCollide = finalFrame !== d.kfCurFrame! &&
             seq.keyframes.some((k) => k.frame === finalFrame);
           if (wouldCollide) {
@@ -695,8 +876,23 @@ export default function TimelineCanvas() {
             drawRef.current();
             return;
           }
-          const rowTop = getRowTop(d.kfSeqIndex, vertScroll);
-          const newValue = clamp(yToValue(y, rowTop, seq), seq.min, seq.max);
+          const rowTop = getRowTop(d.kfSeqIndex, vertScroll, rowHArr, contentTop);
+          const rowH = rowHArr[d.kfSeqIndex];
+          let newValue = clamp(yToValue(y, rowTop, seq, rowH), seq.min, seq.max);
+
+          // Vertical (value) snap to grid lines when snap is enabled
+          if (gridSize > 0) {
+            const valInterval = getValueGridInterval(seq.min, seq.max);
+            const snappedVal = clamp(
+              Math.round(newValue / valInterval) * valInterval,
+              seq.min, seq.max
+            );
+            const dy = Math.abs(
+              valueToY(newValue, rowTop, seq, rowH) - valueToY(snappedVal, rowTop, seq, rowH)
+            );
+            if (dy <= SNAP_PX) newValue = snappedVal;
+          }
+
           moveKeyframe(d.kfSeqId, d.kfCurFrame!, finalFrame, newValue);
           drag.current = {
             ...d,
@@ -720,8 +916,8 @@ export default function TimelineCanvas() {
         setViewStartFrame(d.startViewStart - delta);
       }
     },
-    [viewStartFrame, zoom, vertScroll, durationFrames,
-     setCurrentFrame, setViewStartFrame, moveKeyframe, moveKeyframesBatch, updateKeyframe]
+    [viewStartFrame, zoom, vertScroll, durationFrames, rowHArr,
+     setCurrentFrame, setViewStartFrame, moveKeyframe, moveKeyframesBatch, updateKeyframe, contentTop]
   );
 
   // ─── Mouse up ────────────────────────────────────────────────────
@@ -730,7 +926,6 @@ export default function TimelineCanvas() {
     (e: React.MouseEvent) => {
       const d = drag.current;
 
-      // Sync selectedKeyframes after multi-drag
       if (d.type === 'kf' && d.kfMultiInitPositions && d.kfPrevDelta !== undefined) {
         const delta = d.kfPrevDelta;
         const newSel = new Map<string, Set<number>>();
@@ -755,10 +950,11 @@ export default function TimelineCanvas() {
 
         for (let i = 0; i < sequences.length; i++) {
           const seq = sequences[i];
-          const rowTop = getRowTop(i, vertScroll);
+          const rowTop = getRowTop(i, vertScroll, rowHArr, contentTop);
+          const rowH = rowHArr[i];
           for (const kf of seq.keyframes) {
             const kx = frameToX(kf.frame, vStart, z);
-            const ky = valueToY(kf.value, rowTop, seq);
+            const ky = valueToY(kf.value, rowTop, seq, rowH);
             if (kx >= mx1 && kx <= mx2 && ky >= my1 && ky <= my2) {
               const frames = batch.get(seq.id) ?? new Set<number>();
               frames.add(kf.frame);
@@ -775,8 +971,8 @@ export default function TimelineCanvas() {
       setCursor('crosshair');
       drawRef.current();
     },
-    [sequences, viewStartFrame, zoom, vertScroll, durationFrames,
-     setSelectedKeyframesBatch, setSelectedSequence]
+    [sequences, viewStartFrame, zoom, vertScroll, durationFrames, rowHArr,
+     setSelectedKeyframesBatch, setSelectedSequence, contentTop]
   );
 
   // ─── Right-click context menu ─────────────────────────────────────
@@ -785,12 +981,15 @@ export default function TimelineCanvas() {
     (e: React.MouseEvent) => {
       e.preventDefault();
       const { x, y } = getXY(e);
-      if (y < RULER_H) return;
-      const hit = hitTestKeyframe(x, y, sequences, viewStartFrame, zoom, vertScroll);
+      if (y < contentTop) return;
+      const hit = hitTestKeyframe(x, y, sequences, viewStartFrame, zoom, vertScroll, rowHArr, contentTop);
       if (!hit) return;
       const seq = sequences.find((s) => s.id === hit.seqId);
       const kf = seq?.keyframes.find((k) => k.frame === hit.frame);
       if (!kf) return;
+      const { selectedKeyframes: sel } = useAppStore.getState();
+      const totalSelected = [...sel.values()].reduce((s, set) => s + set.size, 0);
+      const clickedIsSelected = sel.get(hit.seqId)?.has(hit.frame) ?? false;
       const rect = wrapRef.current!.getBoundingClientRect();
       setContextMenu({
         x: e.clientX - rect.left,
@@ -798,28 +997,10 @@ export default function TimelineCanvas() {
         seqId: hit.seqId,
         frame: hit.frame,
         interp: kf.interpolation,
+        isMulti: totalSelected > 1 && clickedIsSelected,
       });
     },
-    [sequences, viewStartFrame, zoom, vertScroll]
-  );
-
-  // ─── Double click → add keyframe ────────────────────────────────
-
-  const handleDoubleClick = useCallback(
-    (e: React.MouseEvent) => {
-      const { x, y } = getXY(e);
-      if (y < RULER_H) return;
-      const rowIndex = Math.floor((y - RULER_H + vertScroll) / ROW_H);
-      if (rowIndex < 0 || rowIndex >= sequences.length) return;
-      const seq = sequences[rowIndex];
-      if (seq.locked) return;
-      const frame = clamp(Math.round(xToFrame(x, viewStartFrame, zoom)), 0, durationFrames);
-      const rowTop = getRowTop(rowIndex, vertScroll);
-      const value = clamp(yToValue(y, rowTop, seq), seq.min, seq.max);
-      addKeyframe(seq.id, { frame, value, interpolation: 'linear' });
-      setSelectedSequence(seq.id);
-    },
-    [sequences, viewStartFrame, zoom, vertScroll, durationFrames, addKeyframe, setSelectedSequence]
+    [sequences, viewStartFrame, zoom, vertScroll, rowHArr, contentTop]
   );
 
   // ─── Wheel ──────────────────────────────────────────────────────
@@ -833,14 +1014,15 @@ export default function TimelineCanvas() {
         const factor = e.deltaY > 0 ? 1.12 : 1 / 1.12;
         setZoom(zoom * factor, pivotFrame);
       } else if (e.shiftKey) {
-        const maxV = Math.max(0, sequences.length * ROW_H - (size.h - RULER_H));
+        const totalH = rowHArr.reduce((a, b) => a + b, 0);
+        const maxV = Math.max(0, totalH - (size.h - contentTop));
         setVertScroll((s) => clamp(s + e.deltaY * 0.5, 0, maxV));
       } else {
         const delta = e.deltaX !== 0 ? e.deltaX : e.deltaY;
         setViewStartFrame(viewStartFrame + delta * zoom * 0.4);
       }
     },
-    [viewStartFrame, zoom, sequences.length, size.h, setZoom, setViewStartFrame]
+    [viewStartFrame, zoom, rowHArr, size.h, setZoom, setViewStartFrame, contentTop]
   );
 
   // ─── Keyboard: delete / copy / paste ────────────────────────────
@@ -850,7 +1032,6 @@ export default function TimelineCanvas() {
       const target = e.target as HTMLElement;
       if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') return;
 
-      // Delete
       if (e.key === 'Delete' || e.key === 'Backspace') {
         const { removeKeyframe, selectedKeyframes: sel, project: proj, clearKeyframeSelection: clearSel } = useAppStore.getState();
         for (const [sid, frames] of sel) {
@@ -862,7 +1043,6 @@ export default function TimelineCanvas() {
         return;
       }
 
-      // Copy (Cmd+C / Ctrl+C)
       if ((e.metaKey || e.ctrlKey) && e.key === 'c') {
         const { selectedKeyframes: sel, project: proj } = useAppStore.getState();
         const entries: ClipEntry[] = [];
@@ -881,7 +1061,6 @@ export default function TimelineCanvas() {
         return;
       }
 
-      // Paste (Cmd+V / Ctrl+V)
       if ((e.metaKey || e.ctrlKey) && e.key === 'v') {
         if (kfClipboard.length === 0) return;
         const { selectedSequenceId: sid, currentFrame: cf, addKeyframes: addKfs } = useAppStore.getState();
@@ -917,7 +1096,6 @@ export default function TimelineCanvas() {
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseUp}
-        onDoubleClick={handleDoubleClick}
         onContextMenu={handleContextMenu}
         onWheel={handleWheel}
       />
@@ -949,6 +1127,11 @@ export default function TimelineCanvas() {
           className="absolute z-50 bg-[#252525] border border-[#4a4a4a] rounded-lg shadow-xl py-1 min-w-[120px]"
           style={{ left: contextMenu.x, top: contextMenu.y }}
         >
+          {contextMenu.isMulti && (
+            <div className="px-3 py-1 text-[10px] text-[#555] border-b border-[#3a3a3a] mb-0.5 select-none">
+              {tl('applyToMulti')}
+            </div>
+          )}
           {INTERP_OPTIONS.map(({ value, label }) => (
             <button
               key={value}
@@ -959,7 +1142,16 @@ export default function TimelineCanvas() {
               }`}
               onMouseDown={(ev) => {
                 ev.preventDefault();
-                updateKeyframe(contextMenu.seqId, contextMenu.frame, { interpolation: value });
+                if (contextMenu.isMulti) {
+                  const { selectedKeyframes: sel } = useAppStore.getState();
+                  for (const [sid, frames] of sel) {
+                    for (const f of frames) {
+                      updateKeyframe(sid, f, { interpolation: value });
+                    }
+                  }
+                } else {
+                  updateKeyframe(contextMenu.seqId, contextMenu.frame, { interpolation: value });
+                }
                 setContextMenu(null);
               }}
             >

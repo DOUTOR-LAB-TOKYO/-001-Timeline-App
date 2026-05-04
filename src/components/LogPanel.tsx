@@ -1,6 +1,7 @@
 import { useRef, useEffect } from 'react';
 import { Trash2 } from 'lucide-react';
 import { useAppStore } from '../store';
+import { useT } from '../lib/i18n';
 import { cn } from '../lib/utils';
 
 export default function LogPanel() {
@@ -9,6 +10,7 @@ export default function LogPanel() {
   const oscConfig = useAppStore((s) => s.project.oscConfig);
   const isPlaying = useAppStore((s) => s.isPlaying);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const t = useT();
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'instant' });
@@ -26,7 +28,7 @@ export default function LogPanel() {
                 isPlaying ? 'bg-[#4ade80] animate-pulse' : 'bg-[#555]'
               )}
             />
-            <span className="text-[#555]">{isPlaying ? 'Playing' : 'Stopped'}</span>
+            <span className="text-[#555]">{isPlaying ? t('playing') : t('stopped')}</span>
           </div>
           <div className="flex items-center gap-1.5 text-[10px]">
             <span
@@ -42,7 +44,7 @@ export default function LogPanel() {
           <button
             onClick={clearLogs}
             className="text-[#555] hover:text-[#aaa] transition-colors"
-            title="ログをクリア"
+            title={t('clearLog')}
           >
             <Trash2 size={11} />
           </button>

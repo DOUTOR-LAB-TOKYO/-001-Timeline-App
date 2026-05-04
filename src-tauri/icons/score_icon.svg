@@ -4,64 +4,54 @@
       <stop offset="0%" stop-color="#1e2020"/>
       <stop offset="100%" stop-color="#111313"/>
     </linearGradient>
-    <linearGradient id="glow" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0%" stop-color="#4ade80" stop-opacity="0"/>
-      <stop offset="30%" stop-color="#4ade80" stop-opacity="0.15"/>
-      <stop offset="70%" stop-color="#4ade80" stop-opacity="0.15"/>
-      <stop offset="100%" stop-color="#4ade80" stop-opacity="0"/>
-    </linearGradient>
-    <clipPath id="round">
-      <rect width="1024" height="1024" rx="220" ry="220"/>
-    </clipPath>
   </defs>
 
   <!-- Background -->
   <rect width="1024" height="1024" rx="220" ry="220" fill="url(#bg)"/>
+  <rect width="1024" height="1024" rx="220" ry="220" fill="none" stroke="#2a2e2e" stroke-width="3"/>
 
-  <!-- Subtle inner border -->
-  <rect width="1024" height="1024" rx="220" ry="220" fill="none" stroke="#2a2e2e" stroke-width="2"/>
+  <!-- Track 1 line (y=310) -->
+  <line x1="80" y1="310" x2="944" y2="310" stroke="#2e3232" stroke-width="4"/>
+  <!-- Track 2 line (y=512) -->
+  <line x1="80" y1="512" x2="944" y2="512" stroke="#2e3232" stroke-width="4"/>
+  <!-- Track 3 line (y=714) -->
+  <line x1="80" y1="714" x2="944" y2="714" stroke="#2e3232" stroke-width="4"/>
 
-  <!-- Playhead glow -->
-  <rect x="0" y="280" width="1024" height="464" fill="url(#glow)" clip-path="url(#round)"/>
+  <!-- ── Track 1 (green) ── -->
+  <!-- KF A x=200 -->
+  <polygon points="200,310 248,262 296,310 248,358" fill="#4ade80"/>
+  <!-- KF B x=530 -->
+  <polygon points="530,310 578,262 626,310 578,358" fill="#4ade80" opacity="0.45"/>
+  <!-- KF C x=820 -->
+  <polygon points="820,310 868,262 916,310 868,358" fill="#4ade80"/>
+  <!-- Connecting segments -->
+  <line x1="248" y1="310" x2="578" y2="310" stroke="#4ade80" stroke-width="5" opacity="0.4"/>
+  <line x1="578" y1="310" x2="868" y2="310" stroke="#4ade80" stroke-width="5" opacity="0.4"/>
 
-  <!-- Timeline track lines (staff lines) -->
-  <!-- Track 1 -->
-  <line x1="112" y1="340" x2="912" y2="340" stroke="#2a2e2e" stroke-width="2"/>
-  <!-- Track 2 -->
-  <line x1="112" y1="512" x2="912" y2="512" stroke="#2a2e2e" stroke-width="2"/>
-  <!-- Track 3 -->
-  <line x1="112" y1="684" x2="912" y2="684" stroke="#2a2e2e" stroke-width="2"/>
+  <!-- ── Track 2 (blue) ── -->
+  <!-- KF A x=140 -->
+  <polygon points="140,512 188,464 236,512 188,560" fill="#60a5fa"/>
+  <!-- KF B x=400 -->
+  <polygon points="400,512 448,464 496,512 448,560" fill="#60a5fa"/>
+  <!-- KF C x=700 -->
+  <polygon points="700,512 748,464 796,512 748,560" fill="#60a5fa" opacity="0.45"/>
+  <!-- Connecting segments -->
+  <line x1="188" y1="512" x2="448" y2="512" stroke="#60a5fa" stroke-width="5" opacity="0.4"/>
+  <line x1="448" y1="512" x2="748" y2="512" stroke="#60a5fa" stroke-width="5" opacity="0.4"/>
 
-  <!-- Track 1 keyframes (diamonds) -->
-  <polygon points="230,340 258,312 286,340 258,368" fill="#4ade80"/>
-  <polygon points="430,340 458,312 486,340 458,368" fill="#4ade80" opacity="0.5"/>
-  <polygon points="660,340 688,312 716,340 688,368" fill="#4ade80"/>
+  <!-- ── Track 3 (amber) ── -->
+  <!-- KF A x=310 -->
+  <polygon points="310,714 358,666 406,714 358,762" fill="#f59e0b" opacity="0.45"/>
+  <!-- KF B x=600 -->
+  <polygon points="600,714 648,666 696,714 648,762" fill="#f59e0b"/>
+  <!-- KF C x=880 -->
+  <polygon points="880,714 928,666 976,714 928,762" fill="#f59e0b"/>
+  <!-- Connecting segments -->
+  <line x1="358" y1="714" x2="648" y2="714" stroke="#f59e0b" stroke-width="5" opacity="0.4"/>
+  <line x1="648" y1="714" x2="928" y2="714" stroke="#f59e0b" stroke-width="5" opacity="0.4"/>
 
-  <!-- Track 1 connecting line -->
-  <line x1="258" y1="340" x2="458" y2="340" stroke="#4ade80" stroke-width="3" opacity="0.35"/>
-  <line x1="458" y1="340" x2="688" y2="340" stroke="#4ade80" stroke-width="3" opacity="0.35"/>
-
-  <!-- Track 2 keyframes -->
-  <polygon points="310,512 338,484 366,512 338,540" fill="#60a5fa"/>
-  <polygon points="530,512 558,484 586,512 558,540" fill="#60a5fa"/>
-  <polygon points="770,512 798,484 826,512 798,540" fill="#60a5fa" opacity="0.5"/>
-
-  <!-- Track 2 connecting line -->
-  <line x1="338" y1="512" x2="558" y2="512" stroke="#60a5fa" stroke-width="3" opacity="0.35"/>
-  <line x1="558" y1="512" x2="798" y2="512" stroke="#60a5fa" stroke-width="3" opacity="0.35"/>
-
-  <!-- Track 3 keyframes -->
-  <polygon points="200,684 228,656 256,684 228,712" fill="#f59e0b" opacity="0.5"/>
-  <polygon points="490,684 518,656 546,684 518,712" fill="#f59e0b"/>
-  <polygon points="740,684 768,656 796,684 768,712" fill="#f59e0b"/>
-
-  <!-- Track 3 connecting line -->
-  <line x1="228" y1="684" x2="518" y2="684" stroke="#f59e0b" stroke-width="3" opacity="0.35"/>
-  <line x1="518" y1="684" x2="768" y2="684" stroke="#f59e0b" stroke-width="3" opacity="0.35"/>
-
-  <!-- Playhead vertical line -->
-  <line x1="530" y1="260" x2="530" y2="764" stroke="#4ade80" stroke-width="5" opacity="0.9"/>
-  <!-- Playhead top triangle -->
-  <polygon points="510,268 550,268 530,296" fill="#4ade80" opacity="0.9"/>
+  <!-- ── Playhead ── -->
+  <line x1="530" y1="210" x2="530" y2="820" stroke="#4ade80" stroke-width="7" opacity="0.95"/>
+  <polygon points="500,218 560,218 530,258" fill="#4ade80" opacity="0.95"/>
 
 </svg>

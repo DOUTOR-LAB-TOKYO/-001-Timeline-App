@@ -42,6 +42,16 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Read release notes
+        id: notes
+        shell: bash
+        run: |
+          {
+            echo 'body<<RELEASE_NOTES_EOF'
+            cat RELEASE_NOTES.md
+            echo 'RELEASE_NOTES_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build & release with tauri-action
         uses: tauri-apps/tauri-action@v0
         env:
@@ -49,16 +59,7 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Eevee ${{ github.ref_name }}"
-          releaseBody: |
-            See the assets below to download the latest version.
-
-            **macOS** users — after installing, open Terminal and run:
-            ```
-            xattr -cr /Applications/Eevee.app
-            ```
-            (One-time step — the app is unsigned. See README for details.)
-
-            **Windows** users — if SmartScreen warns, click "More info" → "Run anyway".
+          releaseBody: ${{ steps.notes.outputs.body }}
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}

@@ -16,8 +16,30 @@ pub struct Keyframe {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColorKeyframe {
+    pub frame: i64,
+    pub r: f64,
+    pub g: f64,
+    pub b: f64,
+    pub a: f64,
+    pub interpolation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Flag {
+    pub id: String,
+    pub frame: i64,
+    #[serde(default)]
+    pub duration: i64,
+    #[serde(default)]
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sequence {
     pub id: String,
+    #[serde(default = "default_kind")]
+    pub kind: String,
     pub name: String,
     pub enabled: bool,
     pub muted: bool,
@@ -35,10 +57,24 @@ pub struct Sequence {
     #[serde(rename = "defaultValue")]
     pub default_value: f64,
     pub keyframes: Vec<Keyframe>,
+    #[serde(default)]
+    pub flags: Vec<Flag>,
+    #[serde(rename = "colorKeyframes", default)]
+    pub color_keyframes: Vec<ColorKeyframe>,
+    #[serde(rename = "colorFormat", default = "default_color_format")]
+    pub color_format: String,
+}
+
+fn default_color_format() -> String {
+    "float".to_string()
 }
 
 fn default_value_type() -> String {
     "float".to_string()
+}
+
+fn default_kind() -> String {
+    "value".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

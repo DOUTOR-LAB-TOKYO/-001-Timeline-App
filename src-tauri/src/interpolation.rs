@@ -1,4 +1,4 @@
-use crate::types::Keyframe;
+use crate::types::{ColorKeyframe, Keyframe};
 
 fn smoothstep(t: f64) -> f64 {
     t * t * (3.0 - 2.0 * t)
@@ -69,4 +69,45 @@ pub fn interpolate(keyframes: &[Keyframe], frame: i64) -> f64 {
         }
         _ => prev.value + (next.value - prev.value) * t,
     }
+}
+
+pub fn interpolate_color(kfs: &[ColorKeyframe], frame: i64) -> (f64, f64, f64, f64) {
+    if kfs.is_empty() {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    let mut sorted = kfs.to_vec();
+    sorted.sort_by_key(|k| k.frame);
+    if frame <= sorted[0].frame {
+        let k = &sorted[0];
+        return (k.r, k.g, k.b, k.a);
+    }
+    let last = &sorted[sorted.len() - 1];
+    if frame >= last.frame {
+        return (last.r, last.g, last.b, last.a);
+    }
+    let mut prev = &sorted[0];
+    let mut next = &sorted[1];
+    for i in 0..sorted.len() - 1 {
+        if frame >= sorted[i].frame && frame < sorted[i + 1].frame {
+            prev = &sorted[i];
+            next = &sorted[i + 1];
+            break;
+        }
+    }
+    let span = (next.frame - prev.frame) as f64;
+    if span == 0.0 {
+        return (next.r, next.g, next.b, next.a);
+    }
+    let t = (frame - prev.frame) as f64 / span;
+    let tt = match prev.interpolation.as_str() {
+        "step" => return (prev.r, prev.g, prev.b, prev.a),
+        "smooth" => smoothstep(t),
+        _ => t,
+    };
+    (
+        prev.r + (next.r - prev.r) * tt,
+        prev.g + (next.g - prev.g) * tt,
+        prev.b + (next.b - prev.b) * tt,
+        prev.a + (next.a - prev.a) * tt,
+    )
 }

@@ -24,7 +24,7 @@ export default function App() {
 
       // ループ検知: 再生中にフレームが大幅に後退 → 音声を再スタート
       if (isPlaying && loopEnabled && prevFrame > 0 && newFrame < prevFrame - 5) {
-        playAudio(loopIn / project.fps);
+        if (!useAppStore.getState().audioMuted) playAudio(loopIn / project.fps);
       }
 
       prevFrameRef.current = newFrame;
@@ -82,7 +82,7 @@ export default function App() {
         setPlay(false);
       } else {
         setPlay(true);
-        playAudio(currentFrame / project.fps);
+        if (!useAppStore.getState().audioMuted) playAudio(currentFrame / project.fps);
         await invoke('start_playback', {
           projectJson: getPlaybackJSON(),
           startFrame: currentFrame,

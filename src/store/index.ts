@@ -1,8 +1,9 @@
 import { create } from 'zustand';
-import type { Project, Sequence, Keyframe, LogEntry } from '../types';
+import type { Project, Sequence, Keyframe, Flag, ColorKeyframe, LogEntry } from '../types';
 import type { Language } from '../lib/i18n';
 import { generateId, clamp, nameToOscAddress } from '../lib/utils';
 import { activateTabAudio, unregisterTabBuffer } from '../lib/audio';
+import { serializeProjectForDirty } from '../lib/projectDirty';
 
 const DEFAULT_COLORS = [
   '#4ade80', '#60a5fa', '#f59e0b', '#f472b6', '#a78bfa',
@@ -12,22 +13,26 @@ const DEFAULT_COLORS = [
 const DEFAULT_FPS = 30;
 const DEFAULT_DURATION = DEFAULT_FPS * 12; // 12 seconds = 360 frames
 
-function createDefaultSequence(index: number): Sequence {
+function createDefaultSequence(index: number, kind: Sequence['kind'] = 'value'): Sequence {
   return {
     id: generateId(),
-    name: `Seq ${index + 1}`,
+    kind,
+    name: kind === 'flag' ? `Flag ${index + 1}` : kind === 'color' ? `Color ${index + 1}` : `Seq ${index + 1}`,
     enabled: true,
     muted: false,
     solo: false,
     locked: false,
     color: DEFAULT_COLORS[index % DEFAULT_COLORS.length],
-    oscAddress: `/seq/${index + 1}`,
+    oscAddress: kind === 'flag' ? `/flag/${index + 1}` : kind === 'color' ? `/color/${index + 1}` : `/seq/${index + 1}`,
     dmxChannel: 0,
     valueType: 'int',
     min: 0,
     max: 100,
     defaultValue: 0,
     keyframes: [],
+    flags: [],
+    colorKeyframes: [],
+    colorFormat: 'float',
   };
 }
 
@@ -51,6 +56,7 @@ export interface TabSnapshot {
   id: string;
   project: Project;
   projectFilePath: string | null;
+  lastSavedProjectJSON: string;
   audioFilePath: string | null;
   waveformSamples: Float32Array | null;
   rowHeights: Map<string, number>;
@@ -72,6 +78,7 @@ function createDefaultTab(nameIndex = 0): TabSnapshot {
     id: generateId(),
     project,
     projectFilePath: null,
+    lastSavedProjectJSON: serializeProjectForDirty(project),
     audioFilePath: null,
     waveformSamples: null,
     rowHeights: new Map(),
@@ -91,6 +98,7 @@ function snapshotFromState(s: AppStore): Omit<TabSnapshot, 'id'> {
   return {
     project: s.project,
     projectFilePath: s.projectFilePath,
+    lastSavedProjectJSON: s.lastSavedProjectJSON,
     audioFilePath: s.audioFilePath,
     waveformSamples: s.waveformSamples,
     rowHeights: s.rowHeights,
@@ -110,6 +118,7 @@ function restoreFromSnapshot(tab: TabSnapshot): Partial<AppStore> {
   return {
     project: tab.project,
     projectFilePath: tab.projectFilePath,
+    lastSavedProjectJSON: tab.lastSavedProjectJSON,
     audioFilePath: tab.audioFilePath,
     waveformSamples: tab.waveformSamples,
     rowHeights: tab.rowHeights,
@@ -158,15 +167,25 @@ interface AppStore {
   // Project
   project: Project;
   projectFilePath: string | null;
+  lastSavedProjectJSON: string;
 
   updateProject: (updates: Partial<Project>) => void;
   setProjectFilePath: (path: string | null) => void;
+  markProjectSaved: (path?: string | null) => void;
+  markTabProjectSaved: (id: string, path?: string | null) => void;
   newProject: () => void;
   loadProjectFromJSON: (json: string, filePath?: string) => void;
   getProjectJSON: () => string;
 
-  addSequence: () => void;
+  addSequence: (kind?: Sequence['kind']) => void;
   removeSequence: (id: string) => void;
+  addFlag: (seqId: string, flag: Flag) => void;
+  updateFlag: (seqId: string, flagId: string, updates: Partial<Flag>) => void;
+  removeFlag: (seqId: string, flagId: string) => void;
+  addColorKeyframe: (seqId: string, kf: ColorKeyframe) => void;
+  updateColorKeyframe: (seqId: string, oldFrame: number, updates: Partial<ColorKeyframe>) => void;
+  removeColorKeyframe: (seqId: string, frame: number) => void;
+  moveColorKeyframe: (seqId: string, fromFrame: number, toFrame: number) => void;
   updateSequence: (id: string, updates: Partial<Sequence>) => void;
   reorderSequence: (fromIndex: number, toIndex: number) => void;
 
@@ -212,8 +231,14 @@ interface AppStore {
   // Audio
   audioFilePath: string | null;
   waveformSamples: Float32Array | null;
+  audioMuted: boolean;
   setAudioFilePath: (path: string | null) => void;
   setWaveformSamples: (samples: Float32Array | null) => void;
+  toggleAudioMuted: () => void;
+
+  // Selected flag (for properties panel)
+  selectedFlag: { seqId: string; flagId: string } | null;
+  setSelectedFlag: (sel: { seqId: string; flagId: string } | null) => void;
 
   // Sequence clipboard
   sequenceClipboard: Sequence | null;
@@ -281,6 +306,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   // ── Project ─────────────────────────────────────────────────────────
   project: initialTab.project,
   projectFilePath: null,
+  lastSavedProjectJSON: initialTab.lastSavedProjectJSON,
 
   updateProject: (updates) =>
     set((s) => {
@@ -288,6 +314,32 @@ export const useAppStore = create<AppStore>((set, get) => ({
       if (updates.durationFrames !== undefined) {
         extra.loopOut = updates.durationFrames;
         if (s.loopIn >= updates.durationFrames) extra.loopIn = 0;
+      }
+      // FPS 変更時: キーフレームのフレーム番号を時間基準でスケール
+      let projectUpdates = { ...updates };
+      if (updates.fps !== undefined && updates.fps !== s.project.fps && updates.fps > 0) {
+        const ratio = updates.fps / s.project.fps;
+        const rescaledSequences = s.project.sequences.map((seq) => ({
+          ...seq,
+          keyframes: seq.keyframes.map((kf) => ({
+            ...kf,
+            frame: Math.round(kf.frame * ratio),
+          })),
+          flags: seq.flags.map((f) => ({
+            ...f,
+            frame: Math.round(f.frame * ratio),
+            duration: Math.round(f.duration * ratio),
+          })),
+          colorKeyframes: seq.colorKeyframes.map((kf) => ({
+            ...kf,
+            frame: Math.round(kf.frame * ratio),
+          })),
+        }));
+        const newDuration = updates.durationFrames ?? Math.round(s.project.durationFrames * ratio);
+        projectUpdates = { ...projectUpdates, sequences: rescaledSequences, durationFrames: newDuration };
+        extra.loopOut = newDuration;
+        extra.loopIn = Math.round(s.loopIn * ratio);
+        extra.currentFrame = Math.round(s.currentFrame * ratio);
       }
       // OSC / Serial / DMX config は全タブに同期
       const globalKeys = ['oscConfig', 'serialConfig', 'dmxConfig'] as const;
@@ -302,24 +354,55 @@ export const useAppStore = create<AppStore>((set, get) => ({
           },
         }));
       }
-      return { project: { ...s.project, ...updates }, ...extra };
+      return { project: { ...s.project, ...projectUpdates }, ...extra };
     }),
 
   setProjectFilePath: (path) => set({ projectFilePath: path }),
 
+  markProjectSaved: (path) =>
+    set((s) => {
+      const filePath = path !== undefined ? path : s.projectFilePath;
+      const lastSavedProjectJSON = serializeProjectForDirty(s.project);
+      return {
+        projectFilePath: filePath,
+        lastSavedProjectJSON,
+        tabs: s.tabs.map((t) =>
+          t.id === s.activeTabId
+            ? { ...t, project: s.project, projectFilePath: filePath, lastSavedProjectJSON }
+            : t
+        ),
+      };
+    }),
+
+  markTabProjectSaved: (id, path) =>
+    set((s) => ({
+      tabs: s.tabs.map((t) => {
+        if (t.id !== id) return t;
+        return {
+          ...t,
+          projectFilePath: path !== undefined ? path : t.projectFilePath,
+          lastSavedProjectJSON: serializeProjectForDirty(t.project),
+        };
+      }),
+    })),
+
   newProject: () =>
-    set({
-      project: createDefaultProject(),
-      projectFilePath: null,
-      currentFrame: 0,
-      isPlaying: false,
-      selectedSequenceId: null,
-      selectedKeyframes: new Map(),
-      viewStartFrame: 0,
-      zoom: 4,
-      audioFilePath: null,
-      waveformSamples: null,
-      rowHeights: new Map(),
+    set(() => {
+      const project = createDefaultProject();
+      return {
+        project,
+        projectFilePath: null,
+        lastSavedProjectJSON: serializeProjectForDirty(project),
+        currentFrame: 0,
+        isPlaying: false,
+        selectedSequenceId: null,
+        selectedKeyframes: new Map(),
+        viewStartFrame: 0,
+        zoom: 4,
+        audioFilePath: null,
+        waveformSamples: null,
+        rowHeights: new Map(),
+      };
     }),
 
   loadProjectFromJSON: (json, filePath) => {
@@ -338,10 +421,15 @@ export const useAppStore = create<AppStore>((set, get) => ({
       project.sequences = project.sequences.map((s) => ({
         ...s,
         dmxChannel: s.dmxChannel ?? 0,
+        kind: s.kind ?? 'value',
+        flags: s.flags ?? [],
+        colorKeyframes: s.colorKeyframes ?? [],
+        colorFormat: s.colorFormat ?? 'float',
       }));
       set({
         project,
         projectFilePath: filePath ?? null,
+        lastSavedProjectJSON: serializeProjectForDirty(project),
         currentFrame: 0,
         isPlaying: false,
         selectedSequenceId: project.sequences[0]?.id ?? null,
@@ -354,11 +442,105 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   getProjectJSON: () => JSON.stringify(get().project, null, 2),
 
-  addSequence: () =>
+  addSequence: (kind = 'value') =>
     set((s) => ({
       project: {
         ...s.project,
-        sequences: [...s.project.sequences, createDefaultSequence(s.project.sequences.length)],
+        sequences: [...s.project.sequences, createDefaultSequence(s.project.sequences.length, kind)],
+      },
+    })),
+
+  addFlag: (seqId, flag) =>
+    set((s) => ({
+      project: {
+        ...s.project,
+        sequences: s.project.sequences.map((seq) =>
+          seq.id === seqId
+            ? { ...seq, flags: [...seq.flags, flag].sort((a, b) => a.frame - b.frame) }
+            : seq
+        ),
+      },
+    })),
+
+  updateFlag: (seqId, flagId, updates) =>
+    set((s) => ({
+      project: {
+        ...s.project,
+        sequences: s.project.sequences.map((seq) =>
+          seq.id === seqId
+            ? {
+                ...seq,
+                flags: seq.flags
+                  .map((f) => (f.id === flagId ? { ...f, ...updates } : f))
+                  .sort((a, b) => a.frame - b.frame),
+              }
+            : seq
+        ),
+      },
+    })),
+
+  removeFlag: (seqId, flagId) =>
+    set((s) => ({
+      project: {
+        ...s.project,
+        sequences: s.project.sequences.map((seq) =>
+          seq.id === seqId ? { ...seq, flags: seq.flags.filter((f) => f.id !== flagId) } : seq
+        ),
+      },
+    })),
+
+  addColorKeyframe: (seqId, kf) =>
+    set((s) => ({
+      project: {
+        ...s.project,
+        sequences: s.project.sequences.map((seq) => {
+          if (seq.id !== seqId) return seq;
+          const filtered = seq.colorKeyframes.filter((k) => k.frame !== kf.frame);
+          return { ...seq, colorKeyframes: [...filtered, kf].sort((a, b) => a.frame - b.frame) };
+        }),
+      },
+    })),
+
+  updateColorKeyframe: (seqId, oldFrame, updates) =>
+    set((s) => ({
+      project: {
+        ...s.project,
+        sequences: s.project.sequences.map((seq) =>
+          seq.id === seqId
+            ? {
+                ...seq,
+                colorKeyframes: seq.colorKeyframes
+                  .map((k) => (k.frame === oldFrame ? { ...k, ...updates } : k))
+                  .sort((a, b) => a.frame - b.frame),
+              }
+            : seq
+        ),
+      },
+    })),
+
+  removeColorKeyframe: (seqId, frame) =>
+    set((s) => ({
+      project: {
+        ...s.project,
+        sequences: s.project.sequences.map((seq) =>
+          seq.id === seqId
+            ? { ...seq, colorKeyframes: seq.colorKeyframes.filter((k) => k.frame !== frame) }
+            : seq
+        ),
+      },
+    })),
+
+  moveColorKeyframe: (seqId, fromFrame, toFrame) =>
+    set((s) => ({
+      project: {
+        ...s.project,
+        sequences: s.project.sequences.map((seq) => {
+          if (seq.id !== seqId) return seq;
+          const kf = seq.colorKeyframes.find((k) => k.frame === fromFrame);
+          if (!kf) return seq;
+          const filtered = seq.colorKeyframes.filter((k) => k.frame !== fromFrame && k.frame !== toFrame);
+          return { ...seq, colorKeyframes: [...filtered, { ...kf, frame: toFrame }].sort((a, b) => a.frame - b.frame) };
+        }),
       },
     })),
 
@@ -548,8 +730,10 @@ export const useAppStore = create<AppStore>((set, get) => ({
   // ── Audio ────────────────────────────────────────────────────────────
   audioFilePath: null,
   waveformSamples: null,
+  audioMuted: false,
   setAudioFilePath: (path) => set({ audioFilePath: path }),
   setWaveformSamples: (samples) => set({ waveformSamples: samples }),
+  toggleAudioMuted: () => set((s) => ({ audioMuted: !s.audioMuted })),
 
   // ── Sync playback ────────────────────────────────────────────────────
   syncPlayback: false,
@@ -583,6 +767,10 @@ export const useAppStore = create<AppStore>((set, get) => ({
     })),
   clearLogs: () => set({ logs: [] }),
 
+  // ── Selected flag ────────────────────────────────────────────────────
+  selectedFlag: null,
+  setSelectedFlag: (sel) => set({ selectedFlag: sel }),
+
   // ── Sequence clipboard ───────────────────────────────────────────────
   sequenceClipboard: null,
 
@@ -600,6 +788,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
       name: `${src.name} copy`,
       oscAddress: `${src.oscAddress}_copy`,
       keyframes: src.keyframes.map((kf) => ({ ...kf })),
+      flags: src.flags.map((f) => ({ ...f, id: generateId() })),
+      colorKeyframes: src.colorKeyframes.map((kf) => ({ ...kf })),
     };
     set((s) => ({
       project: { ...s.project, sequences: [...s.project.sequences, newSeq] },

@@ -5,16 +5,7 @@ import { save } from '@tauri-apps/plugin-dialog';
 import { useAppStore } from '../store';
 import { useT } from '../lib/i18n';
 import { stopAudio } from '../lib/audio';
-import type { TabSnapshot } from '../store';
-
-// タブが未保存の変更を持つか
-function isDirty(tab: TabSnapshot, liveProject?: TabSnapshot['project'], liveFilePath?: string | null): boolean {
-  const project = liveProject ?? tab.project;
-  const filePath = liveFilePath !== undefined ? liveFilePath : tab.projectFilePath;
-  return project.sequences.some((s) => s.keyframes.length > 0)
-    || project.sequences.length > 1
-    || !!filePath;
-}
+import { isProjectDirty } from '../lib/projectDirty';
 
 export default function TabBar() {
   const tabs = useAppStore((s) => s.tabs);
@@ -63,8 +54,8 @@ export default function TabBar() {
     if (!tabSnap) return;
 
     const dirty = isActive
-      ? isDirty(tabSnap, state.project, state.projectFilePath)
-      : isDirty(tabSnap);
+      ? isProjectDirty(state.project, state.lastSavedProjectJSON)
+      : isProjectDirty(tabSnap.project, tabSnap.lastSavedProjectJSON);
 
     if (dirty) {
       setCloseConfirm({ tabId });
@@ -106,9 +97,11 @@ export default function TabBar() {
       if (!filePath) return; // user cancelled save dialog
 
       await invoke('save_project', { path: filePath, content: projectJson });
-      if (isActive) state.setProjectFilePath(filePath);
+      if (isActive) state.markProjectSaved(filePath);
+      else state.markTabProjectSaved(tabId, filePath);
     } catch (e) {
       console.error(e);
+      return;
     }
 
     await closeTab(tabId);

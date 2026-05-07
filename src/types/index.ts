@@ -11,8 +11,27 @@ export interface Keyframe {
   cp2y?: number;
 }
 
+export type SequenceKind = 'value' | 'flag' | 'color';
+
+export interface ColorKeyframe {
+  frame: number;
+  r: number; // 0..1
+  g: number;
+  b: number;
+  a: number;
+  interpolation: Interpolation;
+}
+
+export interface Flag {
+  id: string;
+  frame: number;       // start frame
+  duration: number;    // 0 = point, >0 = range
+  text: string;
+}
+
 export interface Sequence {
   id: string;
+  kind: SequenceKind;  // default 'value' for legacy projects
   name: string;
   enabled: boolean;
   muted: boolean;
@@ -26,6 +45,9 @@ export interface Sequence {
   max: number;
   defaultValue: number;
   keyframes: Keyframe[];
+  flags: Flag[];
+  colorKeyframes: ColorKeyframe[];
+  colorFormat: 'float' | 'int'; // float = 0..1, int = 0..255 (used for color kind)
 }
 
 export interface OscConfig {

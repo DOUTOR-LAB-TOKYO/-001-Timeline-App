@@ -6,7 +6,8 @@ import { clamp } from '../../lib/utils';
 import { RULER_H, WAVEFORM_H, ROW_H } from '../../lib/constants';
 import { useT } from '../../lib/i18n';
 import { playAudio } from '../../lib/audio';
-import type { Interpolation, Sequence, Keyframe } from '../../types';
+import { generateId } from '../../lib/utils';
+import type { Interpolation, Sequence, Keyframe, Flag, ColorKeyframe } from '../../types';
 
 // ─── Constants ───────────────────────────────────────────────────────
 
@@ -114,6 +115,7 @@ function getSnappedFrame(
   options: {
     excludeSeqId?: string;
     excludeFrames?: Set<number>;
+    excludeFlagId?: string;
     gridSize?: number;
   } = {}
 ): { frame: number; snapped: boolean } {
@@ -122,11 +124,21 @@ function getSnappedFrame(
   let bestDist = threshold;
 
   for (const seq of sequences) {
-    if (seq.id === options.excludeSeqId) continue;
-    for (const kf of seq.keyframes) {
-      if (options.excludeFrames?.has(kf.frame)) continue;
-      const dist = Math.abs(kf.frame - rawFrame);
-      if (dist < bestDist) { bestDist = dist; best = kf.frame; }
+    if (seq.id !== options.excludeSeqId) {
+      for (const kf of seq.keyframes) {
+        if (options.excludeFrames?.has(kf.frame)) continue;
+        const dist = Math.abs(kf.frame - rawFrame);
+        if (dist < bestDist) { bestDist = dist; best = kf.frame; }
+      }
+    }
+    for (const f of seq.flags) {
+      if (f.id === options.excludeFlagId) continue;
+      let d = Math.abs(f.frame - rawFrame);
+      if (d < bestDist) { bestDist = d; best = f.frame; }
+      if (f.duration > 0) {
+        d = Math.abs((f.frame + f.duration) - rawFrame);
+        if (d < bestDist) { bestDist = d; best = f.frame + f.duration; }
+      }
     }
   }
 
@@ -220,9 +232,89 @@ function hitTestBzHandle(
   return null;
 }
 
+// ─── Color helpers ───────────────────────────────────────────────────
+
+const COLOR_KF_HALF = 5;
+
+function colorCss(c: { r: number; g: number; b: number; a: number }) {
+  return `rgba(${Math.round(c.r * 255)},${Math.round(c.g * 255)},${Math.round(c.b * 255)},${c.a})`;
+}
+
+function interpolateColorBetween(a: ColorKeyframe, b: ColorKeyframe, frame: number) {
+  if (a.interpolation === 'step') return { r: a.r, g: a.g, b: a.b, a: a.a };
+  const span = b.frame - a.frame || 1;
+  const t = clamp((frame - a.frame) / span, 0, 1);
+  const tt = a.interpolation === 'smooth' ? t * t * (3 - 2 * t) : t;
+  return {
+    r: a.r + (b.r - a.r) * tt,
+    g: a.g + (b.g - a.g) * tt,
+    b: a.b + (b.b - a.b) * tt,
+    a: a.a + (b.a - a.a) * tt,
+  };
+}
+
+interface ColorKfHit { seqId: string; seqIndex: number; frame: number; }
+
+function hitTestColorKeyframe(
+  x: number, y: number,
+  sequences: Sequence[],
+  viewStart: number, zoom: number, vertScroll: number,
+  rowHArr: number[], contentTop: number
+): ColorKfHit | null {
+  for (let i = 0; i < sequences.length; i++) {
+    const seq = sequences[i];
+    if (seq.kind !== 'color') continue;
+    const rowTop = getRowTop(i, vertScroll, rowHArr, contentTop);
+    const rowH = rowHArr[i];
+    if (y < rowTop || y > rowTop + rowH) continue;
+    const cy = rowTop + rowH - COLOR_KF_HALF - 4;
+    for (const kf of seq.colorKeyframes) {
+      const cx = frameToX(kf.frame, viewStart, zoom);
+      if (Math.abs(x - cx) <= COLOR_KF_HALF + 4 && Math.abs(y - cy) <= COLOR_KF_HALF + 4) {
+        return { seqId: seq.id, seqIndex: i, frame: kf.frame };
+      }
+    }
+  }
+  return null;
+}
+
+// ─── Flag hit test ───────────────────────────────────────────────────
+
+const FLAG_PAD_Y = 6;
+const FLAG_RESIZE_PX = 6;
+const FLAG_MIN_PX = 8;
+
+interface FlagHit { seqId: string; seqIndex: number; flag: Flag; edge: 'body' | 'right'; }
+
+function hitTestFlag(
+  x: number, y: number,
+  sequences: Sequence[],
+  viewStart: number, zoom: number, vertScroll: number,
+  rowHArr: number[], contentTop: number
+): FlagHit | null {
+  for (let i = 0; i < sequences.length; i++) {
+    const seq = sequences[i];
+    if (seq.kind !== 'flag') continue;
+    const rowTop = getRowTop(i, vertScroll, rowHArr, contentTop);
+    const rowH = rowHArr[i];
+    if (y < rowTop + FLAG_PAD_Y || y > rowTop + rowH - FLAG_PAD_Y) continue;
+    for (const f of seq.flags) {
+      const x1 = frameToX(f.frame, viewStart, zoom);
+      const w = Math.max(FLAG_MIN_PX, f.duration / zoom);
+      const x2 = x1 + w;
+      if (x < x1 - 2 || x > x2 + 2) continue;
+      if (f.duration > 0 && x >= x2 - FLAG_RESIZE_PX && x <= x2 + 2) {
+        return { seqId: seq.id, seqIndex: i, flag: f, edge: 'right' };
+      }
+      return { seqId: seq.id, seqIndex: i, flag: f, edge: 'body' };
+    }
+  }
+  return null;
+}
+
 // ─── Drag state ──────────────────────────────────────────────────────
 
-type DragType = 'idle' | 'seek' | 'kf' | 'pan' | 'marquee' | 'bz';
+type DragType = 'idle' | 'seek' | 'kf' | 'pan' | 'marquee' | 'bz' | 'flagMove' | 'flagResize' | 'colorKfMove';
 
 interface MultiInitPos { seqId: string; frame: number; value: number; }
 
@@ -235,6 +327,8 @@ interface DragState {
   kfAnchorInitFrame?: number;
   kfPrevDelta?: number;
   bzSeqId?: string; bzFrame?: number; bzHandle?: 'cp1' | 'cp2'; bzNextFrame?: number;
+  flagSeqId?: string; flagId?: string; flagInitFrame?: number; flagInitDuration?: number;
+  ckfSeqId?: string; ckfSeqIndex?: number; ckfCurFrame?: number;
   curX?: number; curY?: number;
 }
 
@@ -260,6 +354,7 @@ export default function TimelineCanvas() {
   const [size, setSize] = useState({ w: 0, h: 0 });
   const [vertScroll, setVertScroll] = useState(0);
   const [cursor, setCursor] = useState<string>('crosshair');
+  const didFitInitialViewRef = useRef(false);
   const [contextMenu, setContextMenu] = useState<{
     x: number; y: number; seqId: string; frame: number; interp: Interpolation; isMulti: boolean;
   } | null>(null);
@@ -286,6 +381,7 @@ export default function TimelineCanvas() {
   const snapGridSize = useAppStore((s) => s.snapGridSize);
   const setSnapGridSize = useAppStore((s) => s.setSnapGridSize);
   const waveformSamples = useAppStore((s) => s.waveformSamples);
+  const selectedFlag = useAppStore((s) => s.selectedFlag);
 
   const contentTop = waveformSamples ? RULER_H + WAVEFORM_H : RULER_H;
   const tl = useT();
@@ -308,7 +404,7 @@ export default function TimelineCanvas() {
     if (seekDebounceRef.current) clearTimeout(seekDebounceRef.current);
     seekDebounceRef.current = setTimeout(async () => {
       await invoke('stop_playback').catch(() => {});
-      playAudio(frame / project.fps);
+      if (!useAppStore.getState().audioMuted) playAudio(frame / project.fps);
       await invoke('start_playback', {
         projectJson: getPlaybackJSON(),
         startFrame: frame,
@@ -382,11 +478,12 @@ export default function TimelineCanvas() {
 
         const numSamples = waveformSamples.length;
         // Map each canvas pixel x to a sample index
+        const waveStep = isPlaying ? 2 : 1;
         ctx.fillStyle = '#3a7a5a';
         ctx.beginPath();
         let firstPoint = true;
         // Draw top half (positive)
-        for (let px = Math.max(0, Math.floor(startX)); px <= Math.min(W, Math.ceil(endX)); px++) {
+        for (let px = Math.max(0, Math.floor(startX)); px <= Math.min(W, Math.ceil(endX)); px += waveStep) {
           const t = (px - startX) / (totalPx > 0 ? totalPx : 1);
           const sIdx = Math.min(numSamples - 1, Math.floor(t * numSamples));
           const amp = waveformSamples[sIdx] * ampH;
@@ -394,7 +491,7 @@ export default function TimelineCanvas() {
           else ctx.lineTo(px, midY - amp);
         }
         // Draw bottom half (mirrored)
-        for (let px = Math.min(W, Math.ceil(endX)); px >= Math.max(0, Math.floor(startX)); px--) {
+        for (let px = Math.min(W, Math.ceil(endX)); px >= Math.max(0, Math.floor(startX)); px -= waveStep) {
           const t = (px - startX) / (totalPx > 0 ? totalPx : 1);
           const sIdx = Math.min(numSamples - 1, Math.floor(t * numSamples));
           const amp = waveformSamples[sIdx] * ampH;
@@ -409,7 +506,7 @@ export default function TimelineCanvas() {
         ctx.globalAlpha = 0.5;
         ctx.beginPath();
         firstPoint = true;
-        for (let px = Math.max(0, Math.floor(startX)); px <= Math.min(W, Math.ceil(endX)); px++) {
+        for (let px = Math.max(0, Math.floor(startX)); px <= Math.min(W, Math.ceil(endX)); px += waveStep) {
           const t = (px - startX) / (totalPx > 0 ? totalPx : 1);
           const sIdx = Math.min(numSamples - 1, Math.floor(t * numSamples));
           const amp = waveformSamples[sIdx] * ampH;
@@ -441,6 +538,134 @@ export default function TimelineCanvas() {
       ctx.fillRect(0, clipTop, W, clipBot - clipTop);
       ctx.fillStyle = '#282828';
       ctx.fillRect(0, rowBot - 1, W, 1);
+
+      // ─ Color row ──────────────────────────────────────────
+      if (seq.kind === 'color') {
+        if (!seq.enabled || seq.muted) continue;
+        ctx.save();
+        ctx.beginPath(); ctx.rect(0, clipTop, W, clipBot - clipTop); ctx.clip();
+        const stripTop = rowTop + 6;
+        const stripBot = rowTop + rowH - COLOR_KF_HALF * 2 - 6;
+        const stripH = Math.max(8, stripBot - stripTop);
+
+        // Checkerboard (alpha visualization)
+        const cell = 6;
+        for (let cy = stripTop; cy < stripTop + stripH; cy += cell) {
+          for (let cx = 0; cx < W; cx += cell) {
+            const dark = ((Math.floor(cx / cell) + Math.floor((cy - stripTop) / cell)) & 1) === 0;
+            ctx.fillStyle = dark ? '#1a1a1a' : '#252525';
+            ctx.fillRect(cx, cy, cell, Math.min(cell, stripTop + stripH - cy));
+          }
+        }
+
+        const sortedC = [...seq.colorKeyframes].sort((a, b) => a.frame - b.frame);
+        if (sortedC.length > 0) {
+          const firstX = frameToX(sortedC[0].frame, vStart, z);
+          const lastX = frameToX(sortedC[sortedC.length - 1].frame, vStart, z);
+          // Solid extension before first kf
+          const c0 = sortedC[0];
+          ctx.fillStyle = colorCss(c0);
+          ctx.fillRect(0, stripTop, Math.max(0, Math.min(W, firstX)), stripH);
+          // Solid extension after last kf
+          const cE = sortedC[sortedC.length - 1];
+          ctx.fillStyle = colorCss(cE);
+          ctx.fillRect(Math.max(0, lastX), stripTop, Math.max(0, W - Math.max(0, lastX)), stripH);
+          // Sample per visible segment, not per keyframe per pixel.
+          const colorStep = isPlaying ? 6 : 3;
+          for (let j = 0; j < sortedC.length - 1; j++) {
+            const a = sortedC[j];
+            const b = sortedC[j + 1];
+            const x1 = frameToX(a.frame, vStart, z);
+            const x2 = frameToX(b.frame, vStart, z);
+            if (x2 < 0 || x1 > W) continue;
+            const sx = Math.max(0, Math.floor(x1));
+            const ex = Math.min(W, Math.ceil(x2));
+            if (a.interpolation === 'step') {
+              ctx.fillStyle = colorCss(a);
+              ctx.fillRect(sx, stripTop, Math.max(1, ex - sx), stripH);
+              continue;
+            }
+            for (let px = sx; px <= ex; px += colorStep) {
+              const nextPx = Math.min(ex + 1, px + colorStep);
+              const frame = xToFrame(px + (nextPx - px) / 2, vStart, z);
+              ctx.fillStyle = colorCss(interpolateColorBetween(a, b, frame));
+              ctx.fillRect(px, stripTop, Math.max(1, nextPx - px), stripH);
+            }
+          }
+        }
+
+        // Border
+        ctx.strokeStyle = '#3a3a3a';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(0.5, stripTop + 0.5, W - 1, stripH - 1);
+
+        // Diamond markers
+        const dy = rowTop + rowH - COLOR_KF_HALF - 4;
+        for (const kf of sortedC) {
+          const dx = frameToX(kf.frame, vStart, z);
+          if (dx < -COLOR_KF_HALF - 1 || dx > W + COLOR_KF_HALF + 1) continue;
+          ctx.save();
+          ctx.translate(dx, dy);
+          ctx.beginPath();
+          ctx.moveTo(0, -COLOR_KF_HALF); ctx.lineTo(COLOR_KF_HALF, 0);
+          ctx.lineTo(0, COLOR_KF_HALF); ctx.lineTo(-COLOR_KF_HALF, 0);
+          ctx.closePath();
+          ctx.fillStyle = `rgb(${Math.round(kf.r*255)},${Math.round(kf.g*255)},${Math.round(kf.b*255)})`;
+          ctx.strokeStyle = '#fff';
+          ctx.lineWidth = 1;
+          ctx.fill(); ctx.stroke();
+          ctx.restore();
+        }
+
+        ctx.restore();
+        continue;
+      }
+
+      // ─ Flag row ───────────────────────────────────────────
+      if (seq.kind === 'flag') {
+        if (!seq.enabled || seq.muted) continue;
+        ctx.save();
+        ctx.beginPath(); ctx.rect(0, clipTop, W, clipBot - clipTop); ctx.clip();
+        const fTop = rowTop + FLAG_PAD_Y;
+        const fH = rowH - FLAG_PAD_Y * 2;
+        ctx.font = `11px ui-sans-serif, system-ui, sans-serif`;
+        ctx.textBaseline = 'middle';
+        for (const f of seq.flags) {
+          const x1 = frameToX(f.frame, vStart, z);
+          const w = Math.max(FLAG_MIN_PX, f.duration / z);
+          if (x1 + w < 0 || x1 > W) continue;
+          const isSelected = selectedFlag?.seqId === seq.id && selectedFlag?.flagId === f.id;
+          ctx.fillStyle = f.duration > 0 ? `${seq.color}55` : seq.color;
+          ctx.fillRect(x1, fTop, w, fH);
+          ctx.strokeStyle = isSelected ? '#fff' : seq.color;
+          ctx.lineWidth = isSelected ? 2 : 1;
+          ctx.strokeRect(x1 + 0.5, fTop + 0.5, w - 1, fH - 1);
+          if (f.text) {
+            ctx.save();
+            const clipX = Math.max(0, x1 + 4);
+            const clipR = Math.min(W, x1 + w - 4);
+            ctx.beginPath();
+            ctx.rect(clipX, fTop, Math.max(0, clipR - clipX), fH);
+            ctx.clip();
+            ctx.fillStyle = '#e0e0e0';
+            ctx.textAlign = 'center';
+            const flagCenter = x1 + w / 2;
+            const textW = ctx.measureText(f.text).width;
+            const halfW = textW / 2;
+            // Clamp center so text stays inside the visible/clipped band
+            const minCenter = clipX + halfW;
+            const maxCenter = clipR - halfW;
+            const textX = minCenter > maxCenter
+              ? (clipX + clipR) / 2
+              : Math.max(minCenter, Math.min(maxCenter, flagCenter));
+            ctx.fillText(f.text, textX, fTop + fH / 2);
+            ctx.textAlign = 'start';
+            ctx.restore();
+          }
+        }
+        ctx.restore();
+        continue;
+      }
 
       // Value grid lines + labels
       {
@@ -482,7 +707,8 @@ export default function TimelineCanvas() {
       ctx.beginPath();
       ctx.strokeStyle = seq.color; ctx.lineWidth = 1.5; ctx.globalAlpha = 0.85;
       let started = false;
-      for (let px = Math.floor(startPx) - 1; px <= Math.ceil(endPx) + 1; px++) {
+      const curveStep = isPlaying ? 2 : 1;
+      for (let px = Math.floor(startPx) - 1; px <= Math.ceil(endPx) + 1; px += curveStep) {
         const f = xToFrame(px, vStart, z);
         if (f < firstKf.frame || f > lastKf.frame) continue;
         const val = interpolateValue(sorted, f);
@@ -594,7 +820,7 @@ export default function TimelineCanvas() {
     }
 
     // ── Snap indicator ─────────────────────────────────────────
-    if ((d.type === 'kf') && d.snapTargetFrame !== undefined) {
+    if ((d.type === 'kf' || d.type === 'flagMove' || d.type === 'flagResize' || d.type === 'colorKfMove') && d.snapTargetFrame !== undefined) {
       const snapX = frameToX(d.snapTargetFrame, vStart, z);
       ctx.save();
       ctx.strokeStyle = '#4ade80'; ctx.lineWidth = 1;
@@ -617,26 +843,19 @@ export default function TimelineCanvas() {
       ctx.strokeStyle = 'rgba(59,130,246,0.55)'; ctx.lineWidth = 1;
       ctx.strokeRect(rx + 0.5, ry + 0.5, rw, rh);
     }
-  }, [size, sequences, fps, durationFrames, currentFrame, viewStartFrame, zoom, selectedKeyframes, vertScroll, rowHArr, waveformSamples, contentTop]);
+  }, [size, sequences, fps, durationFrames, currentFrame, viewStartFrame, zoom, selectedKeyframes, vertScroll, rowHArr, waveformSamples, contentTop, selectedFlag, isPlaying]);
 
   useEffect(() => { drawRef.current = draw; }, [draw]);
-  useEffect(() => { if (!isPlaying) draw(); }, [draw, isPlaying]);
+  useEffect(() => { draw(); }, [draw]);
 
-  // durationFrames 変更時 or 初回サイズ確定時にビュー全体をフィット
+  // 初回サイズ確定時だけ全体をフィット
   useEffect(() => {
-    if (size.w === 0 || durationFrames === 0) return;
+    if (didFitInitialViewRef.current || size.w === 0 || durationFrames === 0) return;
     const usableW = size.w - LEFT_PAD * 2;
     setZoom(durationFrames / usableW);
     setViewStartFrame(0);
+    didFitInitialViewRef.current = true;
   }, [durationFrames, size.w]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  useEffect(() => {
-    if (!isPlaying) return;
-    let raf: number;
-    const loop = () => { drawRef.current(); raf = requestAnimationFrame(loop); };
-    raf = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(raf);
-  }, [isPlaying]);
 
   // ─── Helpers ────────────────────────────────────────────────────
 
@@ -677,10 +896,48 @@ export default function TimelineCanvas() {
         return;
       }
 
+      // Hit test color keyframes
+      const ckfHit = hitTestColorKeyframe(x, y, sequences, vStart, z, vertScroll, rowHArr, contentTop);
+      if (ckfHit) {
+        lastTapRef.current = null;
+        setSelectedSequence(ckfHit.seqId);
+        toggleKeyframeSelection(ckfHit.seqId, ckfHit.frame, e.shiftKey || e.metaKey || e.ctrlKey);
+        const seq = sequences.find((s) => s.id === ckfHit.seqId);
+        if (seq?.locked) return;
+        drag.current = {
+          type: 'colorKfMove', startX: x, startY: y, startViewStart: vStart,
+          ckfSeqId: ckfHit.seqId, ckfSeqIndex: ckfHit.seqIndex, ckfCurFrame: ckfHit.frame,
+        };
+        setCursor('grab');
+        return;
+      }
+
+      // Hit test flags first (only flag-kind sequences)
+      const flagHit = hitTestFlag(x, y, sequences, vStart, z, vertScroll, rowHArr, contentTop);
+      if (flagHit) {
+        lastTapRef.current = null;
+        setSelectedSequence(flagHit.seqId);
+        useAppStore.getState().setSelectedFlag({ seqId: flagHit.seqId, flagId: flagHit.flag.id });
+        const seq = sequences.find((s) => s.id === flagHit.seqId);
+        if (seq?.locked) return;
+        drag.current = {
+          type: flagHit.edge === 'right' ? 'flagResize' : 'flagMove',
+          startX: x, startY: y, startViewStart: vStart,
+          flagSeqId: flagHit.seqId,
+          flagId: flagHit.flag.id,
+          flagInitFrame: flagHit.flag.frame,
+          flagInitDuration: flagHit.flag.duration,
+        };
+        setCursor(flagHit.edge === 'right' ? 'ew-resize' : 'grab');
+        return;
+      }
+
       // Hit test bezier handles first
       const bzHit = hitTestBzHandle(x, y, sequences, vStart, z, vertScroll, useAppStore.getState().selectedKeyframes, rowHArr, contentTop);
       if (bzHit) {
         lastTapRef.current = null;
+        const seq = sequences.find((s) => s.id === bzHit.seqId);
+        if (seq?.locked) return;
         drag.current = {
           type: 'bz', startX: x, startY: y, startViewStart: vStart,
           bzSeqId: bzHit.seqId, bzFrame: bzHit.frame,
@@ -744,9 +1001,36 @@ export default function TimelineCanvas() {
           const seq = sequences[rowIndex];
           if (!seq.locked) {
             const frame = clamp(Math.round(xToFrame(x, vStart, z)), 0, durationFrames);
-            const rowTop = getRowTop(rowIndex, vertScroll, rowHArr, contentTop);
-            const value = clamp(yToValue(y, rowTop, seq, rowHArr[rowIndex]), seq.min, seq.max);
-            addKeyframe(seq.id, { frame, value, interpolation: 'linear' });
+            if (seq.kind === 'color') {
+              const gridSize = useAppStore.getState().snapGridSize;
+              const snap = getSnappedFrame(frame, sequences, z, { gridSize });
+              const sortedC = [...seq.colorKeyframes].sort((a, b) => a.frame - b.frame);
+              const prev = [...sortedC].reverse().find((k) => k.frame <= frame) ?? sortedC[0];
+              const baseColor = prev ? { r: prev.r, g: prev.g, b: prev.b, a: prev.a } : { r: 1, g: 1, b: 1, a: 1 };
+              useAppStore.getState().addColorKeyframe(seq.id, {
+                frame: clamp(snap.frame, 0, durationFrames),
+                ...baseColor,
+                interpolation: 'linear',
+              });
+              setSelectedSequence(seq.id);
+              toggleKeyframeSelection(seq.id, clamp(snap.frame, 0, durationFrames), false);
+            } else if (seq.kind === 'flag') {
+              const defaultDur = Math.round(durationFrames * 0.05);
+              const gridSize = useAppStore.getState().snapGridSize;
+              const snap = getSnappedFrame(frame, sequences, z, { gridSize });
+              const newId = generateId();
+              useAppStore.getState().addFlag(seq.id, {
+                id: newId,
+                frame: clamp(snap.frame, 0, durationFrames - defaultDur),
+                duration: defaultDur,
+                text: '',
+              });
+              useAppStore.getState().setSelectedFlag({ seqId: seq.id, flagId: newId });
+            } else {
+              const rowTop = getRowTop(rowIndex, vertScroll, rowHArr, contentTop);
+              const value = clamp(yToValue(y, rowTop, seq, rowHArr[rowIndex]), seq.min, seq.max);
+              addKeyframe(seq.id, { frame, value, interpolation: 'linear' });
+            }
             setSelectedSequence(seq.id);
           }
         }
@@ -787,11 +1071,83 @@ export default function TimelineCanvas() {
         return;
       }
 
+      if (d.type === 'colorKfMove' && d.ckfSeqId && d.ckfCurFrame !== undefined) {
+        const freshSeqs = useAppStore.getState().project.sequences;
+        const seq = freshSeqs.find((s) => s.id === d.ckfSeqId);
+        if (!seq || seq.locked) return;
+        const continuousFrame = clamp(xToFrame(x, d.startViewStart, z), 0, durationFrames);
+        const rawFrame = Math.round(continuousFrame);
+        const gridSize = useAppStore.getState().snapGridSize;
+        const snap = getSnappedFrame(rawFrame, freshSeqs, z, { excludeSeqId: d.ckfSeqId, gridSize });
+        const finalFrame = snap.frame;
+        if (finalFrame !== d.ckfCurFrame && !seq.colorKeyframes.some((k) => k.frame === finalFrame)) {
+          useAppStore.getState().moveColorKeyframe(d.ckfSeqId, d.ckfCurFrame, finalFrame);
+          // remap selection
+          const sel = useAppStore.getState().selectedKeyframes;
+          const frames = sel.get(d.ckfSeqId);
+          if (frames?.has(d.ckfCurFrame)) {
+            const next = new Set(frames);
+            next.delete(d.ckfCurFrame); next.add(finalFrame);
+            const m = new Map(sel); m.set(d.ckfSeqId, next);
+            setSelectedKeyframesBatch(m);
+          }
+          drag.current = { ...d, ckfCurFrame: finalFrame, snapTargetFrame: snap.snapped ? finalFrame : undefined };
+        } else {
+          drag.current = { ...d, snapTargetFrame: snap.snapped ? snap.frame : undefined };
+        }
+        drawRef.current();
+        return;
+      }
+
+      if ((d.type === 'flagMove' || d.type === 'flagResize') && d.flagSeqId && d.flagId) {
+        const dxFrames = (x - d.startX) * z;
+        const updateFlag = useAppStore.getState().updateFlag;
+        const freshSeqs = useAppStore.getState().project.sequences;
+        const seq = freshSeqs.find((s) => s.id === d.flagSeqId);
+        if (!seq || seq.locked) return;
+        const gridSize = useAppStore.getState().snapGridSize;
+        const initFrame = d.flagInitFrame ?? 0;
+        const initDur = d.flagInitDuration ?? 0;
+
+        if (d.type === 'flagMove') {
+          const rawFrame = clamp(Math.round(initFrame + dxFrames), 0, durationFrames - initDur);
+          // Snap the leading edge (start), and also test trailing edge for snap-to-edge
+          const snapStart = getSnappedFrame(rawFrame, freshSeqs, z, { excludeFlagId: d.flagId, gridSize });
+          const snapEnd = initDur > 0
+            ? getSnappedFrame(rawFrame + initDur, freshSeqs, z, { excludeFlagId: d.flagId, gridSize })
+            : { frame: rawFrame + initDur, snapped: false };
+          let finalFrame = rawFrame;
+          let snapTarget: number | undefined;
+          // Pick whichever edge has a smaller pixel distance, if any snapped
+          const distStart = snapStart.snapped ? Math.abs(snapStart.frame - rawFrame) : Infinity;
+          const distEnd = snapEnd.snapped ? Math.abs(snapEnd.frame - (rawFrame + initDur)) : Infinity;
+          if (distStart <= distEnd && snapStart.snapped) {
+            finalFrame = snapStart.frame;
+            snapTarget = snapStart.frame;
+          } else if (snapEnd.snapped) {
+            finalFrame = snapEnd.frame - initDur;
+            snapTarget = snapEnd.frame;
+          }
+          finalFrame = clamp(finalFrame, 0, durationFrames - initDur);
+          updateFlag(d.flagSeqId, d.flagId, { frame: finalFrame });
+          drag.current = { ...d, snapTargetFrame: snapTarget };
+        } else {
+          const rawEnd = clamp(Math.round(initFrame + initDur + dxFrames), initFrame, durationFrames);
+          const snap = getSnappedFrame(rawEnd, freshSeqs, z, { excludeFlagId: d.flagId, gridSize });
+          const finalEnd = clamp(snap.frame, initFrame, durationFrames);
+          updateFlag(d.flagSeqId, d.flagId, { duration: finalEnd - initFrame });
+          drag.current = { ...d, snapTargetFrame: snap.snapped ? finalEnd : undefined };
+        }
+        drawRef.current();
+        return;
+      }
+
       if (d.type === 'bz' && d.bzSeqId && d.bzFrame !== undefined && d.bzNextFrame !== undefined && d.bzHandle) {
         const freshSeqs = useAppStore.getState().project.sequences;
         const seqIdx = freshSeqs.findIndex((s) => s.id === d.bzSeqId);
         if (seqIdx < 0) return;
         const seq = freshSeqs[seqIdx];
+        if (seq.locked) return;
         const kf = seq.keyframes.find((k) => k.frame === d.bzFrame);
         const nextKf = seq.keyframes.find((k) => k.frame === d.bzNextFrame);
         if (!kf || !nextKf) return;
@@ -982,6 +1338,22 @@ export default function TimelineCanvas() {
       e.preventDefault();
       const { x, y } = getXY(e);
       if (y < contentTop) return;
+      const flagHit = hitTestFlag(x, y, sequences, viewStartFrame, zoom, vertScroll, rowHArr, contentTop);
+      if (flagHit) {
+        const seq = sequences.find((s) => s.id === flagHit.seqId);
+        if (seq?.locked) return;
+        useAppStore.getState().removeFlag(flagHit.seqId, flagHit.flag.id);
+        drawRef.current();
+        return;
+      }
+      const ckfHitR = hitTestColorKeyframe(x, y, sequences, viewStartFrame, zoom, vertScroll, rowHArr, contentTop);
+      if (ckfHitR) {
+        const seq = sequences.find((s) => s.id === ckfHitR.seqId);
+        if (seq?.locked) return;
+        useAppStore.getState().removeColorKeyframe(ckfHitR.seqId, ckfHitR.frame);
+        drawRef.current();
+        return;
+      }
       const hit = hitTestKeyframe(x, y, sequences, viewStartFrame, zoom, vertScroll, rowHArr, contentTop);
       if (!hit) return;
       const seq = sequences.find((s) => s.id === hit.seqId);
@@ -1033,11 +1405,15 @@ export default function TimelineCanvas() {
       if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') return;
 
       if (e.key === 'Delete' || e.key === 'Backspace') {
-        const { removeKeyframe, selectedKeyframes: sel, project: proj, clearKeyframeSelection: clearSel } = useAppStore.getState();
+        const { removeKeyframe, removeColorKeyframe, selectedKeyframes: sel, project: proj, clearKeyframeSelection: clearSel } = useAppStore.getState();
         for (const [sid, frames] of sel) {
           const seq = proj.sequences.find((s) => s.id === sid);
           if (!seq || seq.locked) continue;
-          frames.forEach((f) => removeKeyframe(sid, f));
+          if (seq.kind === 'color') {
+            frames.forEach((f) => removeColorKeyframe(sid, f));
+          } else {
+            frames.forEach((f) => removeKeyframe(sid, f));
+          }
         }
         clearSel();
         return;

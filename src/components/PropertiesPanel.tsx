@@ -283,6 +283,12 @@ export default function PropertiesPanel() {
   const updateSequence = useAppStore((s) => s.updateSequence);
   const updateKeyframe = useAppStore((s) => s.updateKeyframe);
   const removeKeyframe = useAppStore((s) => s.removeKeyframe);
+  const updateColorKeyframe = useAppStore((s) => s.updateColorKeyframe);
+  const removeColorKeyframe = useAppStore((s) => s.removeColorKeyframe);
+  const selectedFlag = useAppStore((s) => s.selectedFlag);
+  const updateFlag = useAppStore((s) => s.updateFlag);
+  const removeFlag = useAppStore((s) => s.removeFlag);
+  const setSelectedFlag = useAppStore((s) => s.setSelectedFlag);
   const fps = useAppStore((s) => s.project.fps);
   const durationFrames = useAppStore((s) => s.project.durationFrames);
   const t = useT();
@@ -329,7 +335,8 @@ export default function PropertiesPanel() {
                 {nameToOscAddress(projectName || 'tab')}{seq.oscAddress.startsWith('/') ? seq.oscAddress : '/' + seq.oscAddress}
               </span>
             </Field>
-            <Field label="DMX Channel">
+            {seq.kind !== 'flag' && <>
+            <Field label={seq.kind === 'color' ? 'DMX Channel (R, G, B, A)' : 'DMX Channel'}>
               <div className="flex items-center gap-1">
                 <input
                   type="number"
@@ -349,6 +356,29 @@ export default function PropertiesPanel() {
                 )}
               </div>
             </Field>
+            {seq.kind === 'color' && (
+              <Field label="Color Format">
+                <div className="flex rounded overflow-hidden border border-[#3d3d3d]">
+                  {([
+                    { v: 'float' as const, label: 'FLOAT 0–1' },
+                    { v: 'int' as const, label: 'INT 0–255' },
+                  ]).map(({ v, label }) => (
+                    <button
+                      key={v}
+                      onClick={() => updateSequence(seq.id, { colorFormat: v })}
+                      className={`flex-1 py-0.5 text-[10px] transition-colors ${
+                        seq.colorFormat === v
+                          ? 'bg-[#a78bfa] text-black font-semibold'
+                          : 'bg-[#2a2a2a] text-[#888] hover:text-white'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </Field>
+            )}
+            {seq.kind !== 'color' && <>
             <Field label="Value Type">
               <div className="flex rounded overflow-hidden border border-[#3d3d3d]">
                 {(['int', 'float'] as const).map((t) => (
@@ -380,13 +410,83 @@ export default function PropertiesPanel() {
               <NumInput value={seq.defaultValue} step={0.1}
                 onCommit={(v) => updateSequence(seq.id, { defaultValue: v })} />
             </Field>
+            </>}
+            </>}
           </div>
         ) : (
           <p className="text-[#555] text-xs">{t('selectSequence')}</p>
         )}
       </Section>
 
+      {/* Flag properties */}
+      {seq?.kind === 'flag' && (
+        <Section title="Flag">
+          {(() => {
+            const flag = selectedFlag && selectedFlag.seqId === seq.id
+              ? seq.flags.find((f) => f.id === selectedFlag.flagId)
+              : null;
+            if (!flag) {
+              return <p className="text-[#555] text-xs">{t('dblClickToAdd')}</p>;
+            }
+            return (
+              <div className="flex flex-col gap-2">
+                <Field label="Text">
+                  <input
+                    type="text"
+                    value={flag.text}
+                    onChange={(e) => updateFlag(seq.id, flag.id, { text: e.target.value })}
+                    onKeyDown={(e) => e.stopPropagation()}
+                    className="w-full"
+                    placeholder="cue / lyric / state..."
+                  />
+                </Field>
+                <Field label="Frame">
+                  <NumInput
+                    value={flag.frame}
+                    min={0}
+                    max={durationFrames}
+                    step={1}
+                    onCommit={(v) => updateFlag(seq.id, flag.id, { frame: Math.round(v) })}
+                  />
+                </Field>
+                <Field label={`Duration (${(flag.duration / fps).toFixed(3)}s)`}>
+                  <NumInput
+                    value={flag.duration}
+                    min={0}
+                    max={durationFrames}
+                    step={1}
+                    onCommit={(v) => updateFlag(seq.id, flag.id, { duration: Math.max(0, Math.round(v)) })}
+                  />
+                </Field>
+                <button
+                  onClick={() => { removeFlag(seq.id, flag.id); setSelectedFlag(null); }}
+                  className="text-xs text-[#ef4444] hover:text-[#f87171] py-1 border border-[#3d3d3d] rounded hover:border-[#ef4444] transition-colors"
+                >
+                  {t('deleteFlag')}
+                </button>
+              </div>
+            );
+          })()}
+        </Section>
+      )}
+
+      {/* Color keyframe properties */}
+      {seq?.kind === 'color' && (
+        <Section title="Color Keyframe">
+          <ColorKfEditor
+            seq={seq}
+            selFrames={selKfFrames}
+            fps={fps}
+            durationFrames={durationFrames}
+            onUpdate={(f, u) => updateColorKeyframe(seq.id, f, u)}
+            onRemove={(f) => removeColorKeyframe(seq.id, f)}
+            t={t}
+          />
+        </Section>
+      )}
+
       {/* Keyframe properties */}
+      {seq?.kind !== 'flag' && seq?.kind !== 'color' && (
       <Section title={`Keyframe${selKf.length > 1 ? ` (${selKf.length})` : ''}`}>
         {kf && seq ? (
           <div className="flex flex-col gap-2">
@@ -490,7 +590,81 @@ export default function PropertiesPanel() {
           <p className="text-[#555] text-xs">{t('dblClickToAdd')}</p>
         )}
       </Section>
+      )}
 
+    </div>
+  );
+}
+
+function rgbToHex(r: number, g: number, b: number) {
+  const h = (v: number) => Math.max(0, Math.min(255, Math.round(v * 255))).toString(16).padStart(2, '0');
+  return `#${h(r)}${h(g)}${h(b)}`;
+}
+function hexToRgb(hex: string) {
+  const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex.trim());
+  if (!m) return { r: 1, g: 1, b: 1 };
+  return { r: parseInt(m[1], 16) / 255, g: parseInt(m[2], 16) / 255, b: parseInt(m[3], 16) / 255 };
+}
+
+function ColorKfEditor({
+  seq, selFrames, fps, durationFrames, onUpdate, onRemove, t,
+}: {
+  seq: any;
+  selFrames: number[];
+  fps: number;
+  durationFrames: number;
+  onUpdate: (frame: number, updates: any) => void;
+  onRemove: (frame: number) => void;
+  t: (k: any) => string;
+}) {
+  const ckfs = seq.colorKeyframes.filter((k: any) => selFrames.includes(k.frame));
+  if (ckfs.length === 0) {
+    return <p className="text-[#555] text-xs">{t('dblClickToAdd')}</p>;
+  }
+  const kf = ckfs[0];
+  const hex = rgbToHex(kf.r, kf.g, kf.b);
+  return (
+    <div className="flex flex-col gap-2">
+      <Field label="Color">
+        <input
+          type="color"
+          value={hex}
+          onChange={(e) => {
+            const { r, g, b } = hexToRgb(e.target.value);
+            ckfs.forEach((k: any) => onUpdate(k.frame, { r, g, b }));
+          }}
+          className="w-full h-7 rounded cursor-pointer"
+          style={{ background: hex }}
+        />
+      </Field>
+      <Field label={`Alpha (${kf.a.toFixed(2)})`}>
+        <input
+          type="range"
+          min={0} max={1} step={0.01}
+          value={kf.a}
+          onChange={(e) => {
+            const a = parseFloat(e.target.value);
+            ckfs.forEach((k: any) => onUpdate(k.frame, { a }));
+          }}
+          className="w-full"
+        />
+      </Field>
+      <Field label="Frame">
+        <NumInput
+          value={kf.frame}
+          min={0}
+          max={durationFrames}
+          step={1}
+          onCommit={(v) => onUpdate(kf.frame, { frame: Math.round(v) })}
+        />
+      </Field>
+      <Field label={`Time (${(kf.frame / fps).toFixed(3)}s)`} />
+      <button
+        onClick={() => ckfs.forEach((k: any) => onRemove(k.frame))}
+        className="text-xs text-[#ef4444] hover:text-[#f87171] py-1 border border-[#3d3d3d] rounded hover:border-[#ef4444] transition-colors"
+      >
+        {t('deleteKeyframe')}
+      </button>
     </div>
   );
 }

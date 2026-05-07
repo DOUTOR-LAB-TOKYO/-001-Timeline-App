@@ -4,7 +4,7 @@ import { convertFileSrc } from '@tauri-apps/api/core';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import {
   Play, Square, SkipBack, SkipForward, Repeat,
-  FolderOpen, Save, FileText, Download, Settings, Music, X, Link2
+  FolderOpen, Save, FileText, Download, Settings, Music, X, Link2, Volume2, VolumeX
 } from 'lucide-react';
 import { useAppStore } from '../store';
 import { useT, getT, translations } from '../lib/i18n';
@@ -12,6 +12,7 @@ import { formatTime } from '../lib/utils';
 import { cn } from '../lib/utils';
 import SettingsModal from './SettingsModal';
 import { setAudioBuffer, clearAudioBuffer, registerTabBuffer, unregisterTabBuffer, playAudio, stopAudio } from '../lib/audio';
+import { isProjectDirty } from '../lib/projectDirty';
 
 export default function Toolbar() {
   const project = useAppStore((s) => s.project);
@@ -33,14 +34,18 @@ export default function Toolbar() {
   const updateProject = useAppStore((s) => s.updateProject);
   const addLog = useAppStore((s) => s.addLog);
   const projectFilePath = useAppStore((s) => s.projectFilePath);
-  const setProjectFilePath = useAppStore((s) => s.setProjectFilePath);
+  const lastSavedProjectJSON = useAppStore((s) => s.lastSavedProjectJSON);
+  const markProjectSaved = useAppStore((s) => s.markProjectSaved);
   const audioFilePath = useAppStore((s) => s.audioFilePath);
+  const audioMuted = useAppStore((s) => s.audioMuted);
+  const toggleAudioMuted = useAppStore((s) => s.toggleAudioMuted);
   const setAudioFilePath = useAppStore((s) => s.setAudioFilePath);
   const setWaveformSamples = useAppStore((s) => s.setWaveformSamples);
 
   const t = useT();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [newProjectConfirm, setNewProjectConfirm] = useState(false);
+  const [openProjectConfirm, setOpenProjectConfirm] = useState(false);
   const [fpsInput, setFpsInput] = useState<string>(String(project.fps));
   const [durInput, setDurInput] = useState<string>(String(project.durationFrames));
   const fpsFocused = useRef(false);
@@ -58,7 +63,7 @@ export default function Toolbar() {
       setIsPlaying(false);
     } else {
       setIsPlaying(true);
-      playAudio(currentFrame / project.fps);
+      if (!audioMuted) playAudio(currentFrame / project.fps);
       await invoke('start_playback', {
         projectJson: getPlaybackJSON(),
         startFrame: currentFrame,
@@ -82,7 +87,7 @@ export default function Toolbar() {
   const handleSkipBack = () => { handleStop(); setCurrentFrame(0); };
   const handleSkipForward = () => { handleStop(); setCurrentFrame(project.durationFrames); };
 
-  const handleOpenProject = async () => {
+  const performOpenProject = async () => {
     const T = translations[language];
     const path = await open({
       filters: [{ name: 'Timeline Project', extensions: ['tlproj', 'json'] }],
@@ -97,7 +102,15 @@ export default function Toolbar() {
     }
   };
 
-  const handleSaveProject = async () => {
+  const handleOpenProject = async () => {
+    if (isDirty) {
+      setOpenProjectConfirm(true);
+      return;
+    }
+    await performOpenProject();
+  };
+
+  const handleSaveProject = async (): Promise<boolean> => {
     const T = translations[language];
     let filePath = projectFilePath;
     if (!filePath) {
@@ -106,13 +119,15 @@ export default function Toolbar() {
         defaultPath: `${project.projectName}.tlproj`,
       }) as string | null;
     }
-    if (!filePath) return;
+    if (!filePath) return false;
     try {
       await invoke('save_project', { path: filePath, content: getProjectJSON() });
-      setProjectFilePath(filePath);
+      markProjectSaved(filePath);
       addLog(`${T.saved}: ${filePath}`);
+      return true;
     } catch (e) {
       addLog(`${T.saveError}: ${e}`, 'error');
+      return false;
     }
   };
 
@@ -131,9 +146,7 @@ export default function Toolbar() {
     }
   };
 
-  const isDirty = project.sequences.some(s => s.keyframes.length > 0)
-    || project.sequences.length > 1
-    || !!projectFilePath;
+  const isDirty = isProjectDirty(project, lastSavedProjectJSON);
 
   const handleNewProject = () => {
     if (isDirty) { setNewProjectConfirm(true); return; }
@@ -141,7 +154,8 @@ export default function Toolbar() {
   };
 
   const handleNewProjectSave = async () => {
-    await handleSaveProject();
+    const saved = await handleSaveProject();
+    if (!saved) return;
     newProject();
     setNewProjectConfirm(false);
   };
@@ -149,6 +163,18 @@ export default function Toolbar() {
   const handleNewProjectDiscard = () => {
     newProject();
     setNewProjectConfirm(false);
+  };
+
+  const handleOpenProjectSave = async () => {
+    const saved = await handleSaveProject();
+    if (!saved) return;
+    setOpenProjectConfirm(false);
+    await performOpenProject();
+  };
+
+  const handleOpenProjectDiscard = async () => {
+    setOpenProjectConfirm(false);
+    await performOpenProject();
   };
 
   const handleLoadAudio = async () => {
@@ -193,6 +219,18 @@ export default function Toolbar() {
     } catch (e) {
       const { language } = useAppStore.getState();
       addLog(`${getT(language)('audioLoadError')}: ${e}`, 'error');
+    }
+  };
+
+  const handleToggleMute = () => {
+    const nextMuted = !audioMuted;
+    toggleAudioMuted();
+    if (isPlaying) {
+      if (nextMuted) {
+        stopAudio();
+      } else {
+        playAudio(currentFrame / project.fps);
+      }
     }
   };
 
@@ -241,7 +279,15 @@ export default function Toolbar() {
           </ToolBtn>
           {audioFilePath && (
             <>
-              <span className="text-[10px] text-[#4ade80] font-mono max-w-[120px] truncate select-none" title={audioFilePath}>
+              <ToolBtn
+                onClick={handleToggleMute}
+                title={t('muteAudio')}
+                active={audioMuted}
+                activeColor="text-[#f87171]"
+              >
+                {audioMuted ? <VolumeX size={14} /> : <Volume2 size={14} />}
+              </ToolBtn>
+              <span className={`text-[10px] font-mono max-w-[120px] truncate select-none ${audioMuted ? 'text-[#555] line-through' : 'text-[#4ade80]'}`} title={audioFilePath}>
                 {audioFilePath.split('/').pop()}
               </span>
               <button
@@ -355,17 +401,46 @@ export default function Toolbar() {
           </div>
         </div>
       )}
+
+      {openProjectConfirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+          <div className="bg-[#1e1e1e] border border-[#3d3d3d] rounded-lg shadow-xl p-5 w-72 flex flex-col gap-4">
+            <p className="text-sm text-[#ccc]">{t('saveBeforeOpen')}</p>
+            <div className="flex flex-col gap-2">
+              <button
+                onClick={handleOpenProjectSave}
+                className="w-full py-1.5 text-xs rounded bg-[#4ade80] text-black hover:bg-[#22c55e] transition-colors"
+              >
+                {t('saveAndOpen')}
+              </button>
+              <button
+                onClick={handleOpenProjectDiscard}
+                className="w-full py-1.5 text-xs rounded bg-[#2a2a2a] text-[#ccc] hover:bg-[#3a3a3a] transition-colors"
+              >
+                {t('discardAndOpen')}
+              </button>
+              <button
+                onClick={() => setOpenProjectConfirm(false)}
+                className="w-full py-1.5 text-xs rounded bg-transparent text-[#666] hover:text-[#999] transition-colors"
+              >
+                {t('cancel')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }
 
 function ToolBtn({
-  children, onClick, title, active, className,
+  children, onClick, title, active, activeColor, className,
 }: {
   children: React.ReactNode;
   onClick?: () => void;
   title?: string;
   active?: boolean;
+  activeColor?: string;
   className?: string;
 }) {
   return (
@@ -374,7 +449,7 @@ function ToolBtn({
       title={title}
       className={cn(
         'flex items-center justify-center w-7 h-7 rounded text-[#aaa] hover:text-white hover:bg-[#333] transition-colors',
-        active && 'text-[#4ade80] bg-[#2d3d2d]',
+        active && (activeColor ? `${activeColor} bg-[#3d2d2d]` : 'text-[#4ade80] bg-[#2d3d2d]'),
         className
       )}
     >

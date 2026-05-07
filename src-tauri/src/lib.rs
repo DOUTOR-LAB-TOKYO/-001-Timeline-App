@@ -60,23 +60,108 @@ fn export_csv(path: String, project_json: String) -> Result<(), String> {
         serde_json::from_str(&project_json).map_err(|e| e.to_string())?;
 
     let mut out = String::new();
+    let csv_cell = |s: &str| -> String {
+        let formula_like = matches!(
+            s.trim_start_matches(|c| c == ' ' || c == '\t').chars().next(),
+            Some('=' | '+' | '-' | '@')
+        );
+        let mut value = String::new();
+        if formula_like {
+            value.push('\'');
+        }
+        value.push_str(s);
+        let needs_quotes = formula_like
+            || value.contains(',')
+            || value.contains('"')
+            || value.contains('\n')
+            || value.contains('\r');
+        if needs_quotes {
+            format!("\"{}\"", value.replace('"', "\"\""))
+        } else {
+            value
+        }
+    };
 
+    // Header
     out.push_str("frame");
     for seq in &project.sequences {
-        out.push(',');
-        out.push_str(&seq.name.replace(',', "_"));
+        match seq.kind.as_str() {
+            "color" => {
+                for suffix in ["_r", "_g", "_b", "_a"] {
+                    out.push(',');
+                    out.push_str(&csv_cell(&format!("{}{}", seq.name, suffix)));
+                }
+            }
+            "flag" => {
+                for suffix in ["_state", "_text"] {
+                    out.push(',');
+                    out.push_str(&csv_cell(&format!("{}{}", seq.name, suffix)));
+                }
+            }
+            _ => {
+                out.push(',');
+                out.push_str(&csv_cell(&seq.name));
+            }
+        }
     }
     out.push('\n');
 
     for frame in 0..=project.duration_frames {
         out.push_str(&frame.to_string());
         for seq in &project.sequences {
-            out.push(',');
-            if seq.enabled && !seq.muted && !seq.keyframes.is_empty() {
-                let val = interpolation::interpolate(&seq.keyframes, frame);
-                out.push_str(&format!("{:.6}", val));
-            } else {
-                out.push_str(&format!("{:.6}", seq.default_value));
+            match seq.kind.as_str() {
+                "color" => {
+                    let (r, g, b, a) = if seq.enabled && !seq.muted && !seq.color_keyframes.is_empty() {
+                        interpolation::interpolate_color(&seq.color_keyframes, frame)
+                    } else {
+                        (0.0, 0.0, 0.0, 0.0)
+                    };
+                    if seq.color_format == "int" {
+                        let cv = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as i32;
+                        out.push_str(&format!(",{},{},{},{}", cv(r), cv(g), cv(b), cv(a)));
+                    } else {
+                        out.push_str(&format!(",{:.6},{:.6},{:.6},{:.6}", r, g, b, a));
+                    }
+                }
+                "flag" => {
+                    // Find the flag whose [frame, frame+duration] (or exact frame for point) contains current frame.
+                    let mut state = "";
+                    let mut text = String::new();
+                    if seq.enabled && !seq.muted {
+                        for f in &seq.flags {
+                            if f.duration <= 0 {
+                                if f.frame == frame {
+                                    state = "trigger";
+                                    text = f.text.clone();
+                                    break;
+                                }
+                            } else if frame >= f.frame && frame < f.frame + f.duration {
+                                state = "active";
+                                text = f.text.clone();
+                                break;
+                            }
+                        }
+                    }
+                    out.push(',');
+                    out.push_str(&csv_cell(state));
+                    out.push(',');
+                    out.push_str(&csv_cell(&text));
+                }
+                _ => {
+                    out.push(',');
+                    if seq.enabled && !seq.muted && !seq.keyframes.is_empty() {
+                        let val = interpolation::interpolate(&seq.keyframes, frame);
+                        if seq.value_type == "int" {
+                            out.push_str(&(val.round() as i64).to_string());
+                        } else {
+                            out.push_str(&format!("{:.6}", val));
+                        }
+                    } else if seq.value_type == "int" {
+                        out.push_str(&(seq.default_value.round() as i64).to_string());
+                    } else {
+                        out.push_str(&format!("{:.6}", seq.default_value));
+                    }
+                }
             }
         }
         out.push('\n');

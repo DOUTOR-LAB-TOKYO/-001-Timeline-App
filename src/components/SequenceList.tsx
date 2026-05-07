@@ -1,5 +1,5 @@
 import { useState, useRef } from 'react';
-import { Plus, Trash2, Copy, EyeOff, Volume2, VolumeX, Lock, Unlock, GripVertical } from 'lucide-react';
+import { Plus, Trash2, Copy, EyeOff, Lock, Unlock, GripVertical, Flag as FlagIcon, Palette } from 'lucide-react';
 import { useAppStore } from '../store';
 import { useT } from '../lib/i18n';
 import { cn, nameToOscAddress } from '../lib/utils';
@@ -98,7 +98,21 @@ export default function SequenceList() {
             </button>
           )}
           <button
-            onClick={addSequence}
+            onClick={() => addSequence('color')}
+            className="flex items-center justify-center w-5 h-5 rounded text-[#888] hover:text-[#a78bfa] hover:bg-[#333]"
+            title={t('addColorSeq')}
+          >
+            <Palette size={11} />
+          </button>
+          <button
+            onClick={() => addSequence('flag')}
+            className="flex items-center justify-center w-5 h-5 rounded text-[#888] hover:text-[#f59e0b] hover:bg-[#333]"
+            title={t('addFlagSeq')}
+          >
+            <FlagIcon size={11} />
+          </button>
+          <button
+            onClick={() => addSequence()}
             className="flex items-center justify-center w-5 h-5 rounded text-[#888] hover:text-white hover:bg-[#333]"
             title={t('addSequence')}
           >
@@ -213,6 +227,12 @@ function SequenceRow({
           className="w-3 h-3 rounded-full shrink-0 cursor-pointer border-0 p-0"
           style={{ appearance: 'none', background: seq.color }}
         />
+        {seq.kind === 'flag' && (
+          <FlagIcon size={9} className="shrink-0 text-[#f59e0b]" />
+        )}
+        {seq.kind === 'color' && (
+          <Palette size={9} className="shrink-0 text-[#a78bfa]" />
+        )}
         {editing ? (
           <input
             type="text"
@@ -256,15 +276,7 @@ function SequenceRow({
         >
           <EyeOff size={11} />
         </IconBtn>
-        <IconBtn
-          active={seq.muted}
-          activeColor="text-[#f59e0b]"
-          onClick={(e) => { e.stopPropagation(); onUpdate({ muted: !seq.muted }); }}
-          title={seq.muted ? t('unmute') : t('mute')}
-        >
-          {seq.muted ? <VolumeX size={11} /> : <Volume2 size={11} />}
-        </IconBtn>
-        <IconBtn
+<IconBtn
           active={seq.locked}
           activeColor="text-[#60a5fa]"
           onClick={(e) => { e.stopPropagation(); onUpdate({ locked: !seq.locked }); }}

@@ -1,24 +1,17 @@
-# Eevee v0.1.0 — Initial public release (alpha)
+# Eevee v0.1.1 — Loop & shortcut fixes
 
-First public release of **Eevee**, a timeline sequencer for media art and interactive content.
+Maintenance release with playback loop improvements and keyboard shortcut fixes.
 
-Drop keyframes on a timeline and stream the values out via OSC, Serial, and DMX in real time. CSV export for offline playback.
+## Changes since v0.1.0
 
-## What's in this release
-
-- **Three sequence types** — Value (float/int), Color (RGBA, float or int format), Flag (point/range markers with text labels)
-- **Real-time output** — OSC over UDP, Serial text protocol, DMX via ENTTEC Pro
-- **Five interpolation modes** — Linear / Step / Ease In / Ease Out / Ease In-Out
-- **Audio sync** — load audio files, waveform displayed, project length auto-fits to audio
-- **Multi-tab + Sync** — run multiple projects in parallel, optionally synchronized
-- **CSV export** — per-frame value tables for offline playback on microcontrollers
-- **FPS-aware editing** — change FPS later and keyframes keep their time position
-- **7-language UI** — English, 日本語, 한국어, 中文, Español, Français, Português
+- **Live loop editing** — toggling loop / changing loop In-Out now takes effect during playback (previously only on next start)
+- **Audio re-sync on loop** — audio is now re-triggered from `loopIn` via a dedicated `loop_restart` event from the engine, removing the previous frame-jump heuristic
+- **Keyboard shortcuts** — `Cmd/Ctrl+C` and `Cmd/Ctrl+V` no longer hijack text selection; standard browser copy/paste now works when text is highlighted
 
 ## Downloads
 
-- **macOS** (universal): `Eevee_0.1.0_universal.dmg`
-- **Windows** (x64): `Eevee_0.1.0_x64_en-US.msi`
+- **macOS** (universal): `Eevee_0.1.1_universal.dmg`
+- **Windows** (x64): `Eevee_0.1.1_x64_en-US.msi`
 
 ## ⚠️ Installation note (please read)
 
@@ -33,6 +26,19 @@ xattr -cr /Applications/Eevee.app
 
 Code signing is on the roadmap.
 
+## About Eevee
+
+A timeline sequencer for media art and interactive content. Drop keyframes on a timeline and stream the values out via OSC, Serial, and DMX in real time. CSV export for offline playback.
+
+- **Three sequence types** — Value (float/int), Color (RGBA), Flag (point/range markers with text labels)
+- **Real-time output** — OSC over UDP, Serial text protocol, DMX via ENTTEC Pro
+- **Five interpolation modes** — Linear / Step / Ease In / Ease Out / Ease In-Out
+- **Audio sync** — load audio files, waveform displayed, project length auto-fits to audio
+- **Multi-tab + Sync** — run multiple projects in parallel, optionally synchronized
+- **CSV export** — per-frame value tables for offline playback on microcontrollers
+- **FPS-aware editing** — change FPS later and keyframes keep their time position
+- **7-language UI** — English, 日本語, 한국어, 中文, Español, Français, Português
+
 ## Known limitations
 
 - Undo / Redo coverage is partial (being expanded)
@@ -41,8 +47,6 @@ Code signing is on the roadmap.
 - macOS / Windows binaries are unsigned (see installation note)
 
 ## Feedback
-
-This is an alpha release — feedback, bug reports, and feature requests are very welcome.
 
 → [Open an issue](../../issues)
 

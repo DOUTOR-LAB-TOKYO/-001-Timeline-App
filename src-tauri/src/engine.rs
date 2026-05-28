@@ -18,6 +18,9 @@ pub struct EngineInner {
     pub current_frame: i64,
     pub stop_tx: Option<std::sync::mpsc::SyncSender<()>>,
     pub worker: Option<std::thread::JoinHandle<()>>,
+    pub loop_enabled: bool,
+    pub loop_in: i64,
+    pub loop_out: i64,
 }
 
 impl EngineState {
@@ -28,9 +31,19 @@ impl EngineState {
                 current_frame: 0,
                 stop_tx: None,
                 worker: None,
+                loop_enabled: false,
+                loop_in: 0,
+                loop_out: 0,
             })),
         }
     }
+}
+
+pub fn update_loop(state: &EngineState, loop_enabled: bool, loop_in: i64, loop_out: i64) {
+    let mut inner = state.inner.lock().unwrap();
+    inner.loop_enabled = loop_enabled;
+    inner.loop_in = loop_in;
+    inner.loop_out = loop_out;
 }
 
 pub fn start(
@@ -53,6 +66,9 @@ pub fn start(
         inner.is_playing = true;
         inner.current_frame = start_frame;
         inner.stop_tx = Some(tx);
+        inner.loop_enabled = loop_enabled;
+        inner.loop_in = loop_in;
+        inner.loop_out = loop_out;
     }
 
     let inner_arc = Arc::clone(&state.inner);
@@ -91,15 +107,20 @@ pub fn start(
 
             let current_frame = start_frame_ref + frame_offset;
 
-            // Loop or end-of-timeline
-            let end = if loop_enabled { loop_out.min(duration_frames) } else { duration_frames };
+            // Loop or end-of-timeline — read live loop config so UI changes apply mid-playback
+            let (cur_loop_enabled, cur_loop_in, cur_loop_out) = {
+                let inner = inner_arc.lock().unwrap();
+                (inner.loop_enabled, inner.loop_in, inner.loop_out)
+            };
+            let end = if cur_loop_enabled { cur_loop_out.min(duration_frames) } else { duration_frames };
             if current_frame > end {
-                if loop_enabled {
+                if cur_loop_enabled {
                     // Restart from loop_in
                     frame_offset = 0;
-                    start_frame_ref = loop_in;
+                    start_frame_ref = cur_loop_in;
                     start_instant_ref = Instant::now();
-                    prev_frame = loop_in - 1;
+                    prev_frame = cur_loop_in - 1;
+                    let _ = app.emit("loop_restart", cur_loop_in);
                     continue;
                 } else {
                     let mut inner = inner_arc.lock().unwrap();

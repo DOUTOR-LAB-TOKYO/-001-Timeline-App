@@ -40,6 +40,17 @@ fn stop_playback(state: State<'_, EngineState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn update_playback_loop(
+    state: State<'_, EngineState>,
+    loop_enabled: bool,
+    loop_in: i64,
+    loop_out: i64,
+) -> Result<(), String> {
+    engine::update_loop(&state, loop_enabled, loop_in, loop_out);
+    Ok(())
+}
+
+#[tauri::command]
 fn get_current_frame(state: State<'_, EngineState>) -> i64 {
     engine::get_current_frame(&state)
 }
@@ -183,6 +194,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_playback,
             stop_playback,
+            update_playback_loop,
             get_current_frame,
             load_project,
             save_project,

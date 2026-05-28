@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { invoke } from '@tauri-apps/api/core';
 import type { Project, Sequence, Keyframe, Flag, ColorKeyframe, LogEntry } from '../types';
 import type { Language } from '../lib/i18n';
 import { generateId, clamp, nameToOscAddress } from '../lib/utils';
@@ -679,9 +680,28 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   setCurrentFrame: (frame) => set({ currentFrame: frame }),
   setIsPlaying: (v) => set({ isPlaying: v }),
-  toggleLoop: () => set((s) => ({ loopEnabled: !s.loopEnabled })),
-  setLoopIn: (frame) => set({ loopIn: frame }),
-  setLoopOut: (frame) => set({ loopOut: frame }),
+  toggleLoop: () =>
+    set((s) => {
+      const next = !s.loopEnabled;
+      if (s.isPlaying) {
+        invoke('update_playback_loop', { loopEnabled: next, loopIn: s.loopIn, loopOut: s.loopOut }).catch(console.error);
+      }
+      return { loopEnabled: next };
+    }),
+  setLoopIn: (frame) =>
+    set((s) => {
+      if (s.isPlaying) {
+        invoke('update_playback_loop', { loopEnabled: s.loopEnabled, loopIn: frame, loopOut: s.loopOut }).catch(console.error);
+      }
+      return { loopIn: frame };
+    }),
+  setLoopOut: (frame) =>
+    set((s) => {
+      if (s.isPlaying) {
+        invoke('update_playback_loop', { loopEnabled: s.loopEnabled, loopIn: s.loopIn, loopOut: frame }).catch(console.error);
+      }
+      return { loopOut: frame };
+    }),
 
   // ── UI ──────────────────────────────────────────────────────────────
   selectedSequenceId: null,

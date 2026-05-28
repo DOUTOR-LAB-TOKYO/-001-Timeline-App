@@ -18,17 +18,12 @@ export default function App() {
 
   useEffect(() => {
     const unlistenFrame = listen<FrameUpdatePayload>('frame_update', (e) => {
-      const newFrame = e.payload.frame;
-      const prevFrame = prevFrameRef.current;
-      const { isPlaying, loopEnabled, loopIn, project } = useAppStore.getState();
-
-      // ループ検知: 再生中にフレームが大幅に後退 → 音声を再スタート
-      if (isPlaying && loopEnabled && prevFrame > 0 && newFrame < prevFrame - 5) {
-        if (!useAppStore.getState().audioMuted) playAudio(loopIn / project.fps);
-      }
-
-      prevFrameRef.current = newFrame;
-      setCurrentFrame(newFrame);
+      prevFrameRef.current = e.payload.frame;
+      setCurrentFrame(e.payload.frame);
+    });
+    const unlistenLoop = listen<number>('loop_restart', (e) => {
+      const { audioMuted, project } = useAppStore.getState();
+      if (!audioMuted) playAudio(e.payload / project.fps);
     });
     const unlistenStop = listen('playback_stopped', () => {
       stopAudio();
@@ -37,6 +32,7 @@ export default function App() {
     });
     return () => {
       unlistenFrame.then((fn) => fn());
+      unlistenLoop.then((fn) => fn());
       unlistenStop.then((fn) => fn());
     };
   }, [setCurrentFrame, setIsPlaying]);
@@ -58,15 +54,18 @@ export default function App() {
         return;
       }
 
+      // テキスト選択中はブラウザのコピー/貼り付けに任せる
+      const hasTextSelection = !!window.getSelection()?.toString();
+
       // Cmd/Ctrl+C — copy selected sequence
-      if ((e.metaKey || e.ctrlKey) && e.key === 'c' && !inInput) {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'c' && !inInput && !hasTextSelection) {
         const { selectedSequenceId, copySequence } = useAppStore.getState();
         if (selectedSequenceId) { e.preventDefault(); copySequence(selectedSequenceId); }
         return;
       }
 
       // Cmd/Ctrl+V — paste sequence
-      if ((e.metaKey || e.ctrlKey) && e.key === 'v' && !inInput) {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'v' && !inInput && !hasTextSelection) {
         const { pasteSequence, sequenceClipboard } = useAppStore.getState();
         if (sequenceClipboard) { e.preventDefault(); pasteSequence(); }
         return;
